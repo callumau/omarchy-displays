@@ -320,6 +320,128 @@ function freePosition(monitors, name) {
   return { x: found ? right : 0, y: 0 }
 }
 
+function layoutSize(monitor) {
+  var w = Number(monitor && (monitor.layoutWidth || monitor.logicalWidth)) || 0
+  var h = Number(monitor && (monitor.layoutHeight || monitor.logicalHeight)) || 0
+  return { w: Math.max(1, Math.round(w)), h: Math.max(1, Math.round(h)) }
+}
+
+function rectsOverlap(ax, ay, aw, ah, bx, by, bw, bh) {
+  return ax < bx + bw && bx < ax + aw && ay < by + bh && by < ay + ah
+}
+
+// Snap candidates for the top-left corner of the named monitor: the origin,
+// every enabled sibling's left/right edges (for our left edge), our width
+// shifted variants (for our right edge to align), and the same on Y.
+function snapCandidates(monitors, name) {
+  var xs = [0]
+  var ys = [0]
+  var sw = 0
+  var sh = 0
+
+  if (Array.isArray(monitors)) {
+    for (var i = 0; i < monitors.length; i++) {
+      if (monitors[i] && monitors[i].name === name) {
+        var self = layoutSize(monitors[i])
+        sw = self.w
+        sh = self.h
+      }
+    }
+    for (var j = 0; j < monitors.length; j++) {
+      var other = monitors[j]
+      if (!other || other.name === name || !other.enabled) continue
+      var size = layoutSize(other)
+      xs.push(other.x, other.x + size.w, other.x - sw, other.x + size.w - sw)
+      ys.push(other.y, other.y + size.h, other.y - sh, other.y + size.h - sh)
+    }
+  }
+  return { xs: xs, ys: ys, w: sw, h: sh }
+}
+
+function nearestCandidate(value, candidates, magnet) {
+  var best = null
+  var bestDistance = Infinity
+  for (var i = 0; i < candidates.length; i++) {
+    var candidate = Number(candidates[i])
+    if (!isFinite(candidate)) continue
+    var distance = Math.abs(value - candidate)
+    if (distance < bestDistance) {
+      best = candidate
+      bestDistance = distance
+    }
+  }
+  return bestDistance <= magnet ? best : null
+}
+
+// Drag resolution with edge snapping and collision push-out. The pointer
+// position first snaps to a nearby edge (24px magnet) or an 8px grid, then
+// any overlap with an enabled sibling is resolved by pushing out along the
+// axis of least penetration — so dragging one display through another slides
+// it around instead of inside. Returns the position plus which axes snapped,
+// or null when no overlap-free position exists (the card stays put).
+function resolveDrag(monitors, name, rawX, rawY) {
+  if (!Array.isArray(monitors) || !isFinite(Number(rawX)) || !isFinite(Number(rawY))) return null
+
+  var self = null
+  for (var i = 0; i < monitors.length; i++) {
+    if (monitors[i] && monitors[i].name === name) {
+      self = monitors[i]
+      break
+    }
+  }
+  if (!self || !self.enabled) return null
+
+  var size = layoutSize(self)
+  var w = size.w
+  var h = size.h
+  var candidates = snapCandidates(monitors, name)
+
+  var snapX = nearestCandidate(rawX, candidates.xs, 24)
+  var snapY = nearestCandidate(rawY, candidates.ys, 24)
+  var x = snapX !== null ? snapX : Math.round(rawX / 8) * 8
+  var y = snapY !== null ? snapY : Math.round(rawY / 8) * 8
+
+  function firstOverlap() {
+    for (var k = 0; k < monitors.length; k++) {
+      var other = monitors[k]
+      if (!other || other.name === name || !other.enabled) continue
+      var otherSize = layoutSize(other)
+      if (rectsOverlap(x, y, w, h, other.x, other.y, otherSize.w, otherSize.h)) return other
+    }
+    return null
+  }
+
+  for (var iter = 0; iter < 8; iter++) {
+    var hit = firstOverlap()
+    if (!hit) break
+    var hitSize = layoutSize(hit)
+
+    // Minimal-translation-vector: push out along the shallowest axis so the
+    // card slides around the obstacle instead of jumping across it. Ties
+    // prefer vertical, which reads as sliding over/through while dragging
+    // horizontally (and mirrors for vertical drags).
+    var pushLeft = (x + w) - hit.x
+    var pushRight = (hit.x + hitSize.w) - x
+    var pushUp = (y + h) - hit.y
+    var pushDown = (hit.y + hitSize.h) - y
+    var minimum = Math.min(pushLeft, pushRight, pushUp, pushDown)
+
+    if (minimum === pushUp) y = hit.y - h
+    else if (minimum === pushDown) y = hit.y + hitSize.h
+    else if (minimum === pushLeft) x = hit.x - w
+    else x = hit.x + hitSize.w
+  }
+
+  if (firstOverlap()) return null
+
+  return {
+    x: Math.round(x),
+    y: Math.round(y),
+    snappedX: candidates.xs.indexOf(x) >= 0,
+    snappedY: candidates.ys.indexOf(y) >= 0
+  }
+}
+
 function identityOf(monitor) {
   if (!monitor) return ""
   return monitor.description ? String(monitor.description) : String(monitor.name || "")
@@ -520,6 +642,11 @@ if (typeof module !== "undefined") {
     monitorOverlaps: monitorOverlaps,
     sortedByPosition: sortedByPosition,
     freePosition: freePosition,
+    layoutSize: layoutSize,
+    rectsOverlap: rectsOverlap,
+    snapCandidates: snapCandidates,
+    nearestCandidate: nearestCandidate,
+    resolveDrag: resolveDrag,
     identityOf: identityOf,
     comboMonitors: comboMonitors,
     comboKey: comboKey,

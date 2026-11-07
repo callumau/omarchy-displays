@@ -31,5 +31,6 @@ jobs:
       - name: Run tests
         run: |
           node tests/model.test.js
+          node tests/drag.test.js
           bash tests/apply-order.test.sh
           bash tests/apply-displays.test.sh

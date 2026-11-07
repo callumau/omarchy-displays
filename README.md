@@ -11,6 +11,10 @@ for safe swaps.
 ## Features
 
 - **Drag to arrange** displays on a visual canvas, with edge and origin snapping.
+  Accent guide lines mark the snapped edge while dragging. A display dragged
+  into another one slides around it instead of overlapping — an overlap-free
+  spot is always what gets applied, and dropping somewhere nothing fits leaves
+  the display where it was.
 - **Auto** packs displays left to right; **Swap** reverses the order (the
   quickest fix when left and right are inverted).
 - **Primary** moves the selected display to `0,0` and packs the rest to its
@@ -138,6 +142,7 @@ Run the local checks:
 bash -n apply-displays.sh
 python3 -m py_compile apply-order.py
 node tests/model.test.js
+node tests/drag.test.js
 bash tests/apply-order.test.sh
 bash tests/apply-displays.test.sh
 ```

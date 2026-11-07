@@ -2,7 +2,7 @@
   "schemaVersion": 1,
   "id": "io.github.callumau.displays",
   "name": "Displays",
-  "version": "1.2.3",
+  "version": "1.3.0",
   "author": "Callum (callumau)",
   "license": "MIT",
   "description": "Arrange monitors, set resolution, refresh rate and primary, and restore layouts automatically for each connected monitor set",

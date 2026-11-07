@@ -67,6 +67,13 @@ Panel {
   property real dragStartX: 0
   property real dragStartY: 0
 
+  // Snap guide lines drawn on the canvas while dragging: the dragged card's
+  // snapped left/top edge, which always sits on a sibling's edge (or 0).
+  property bool snapX: false
+  property int snapGuideX: 0
+  property bool snapY: false
+  property int snapGuideY: 0
+
   readonly property string pluginDir: {
     var url = Qt.resolvedUrl(".").toString()
     if (url.indexOf("file://") !== 0) return ""
@@ -579,6 +586,8 @@ Panel {
       layoutDirty = false
       layoutStatusKey = ""
       layoutStatusDetail = ""
+      snapX = false
+      snapY = false
     }
     recomputeCanvas()
   }
@@ -658,53 +667,34 @@ Panel {
     canvasOffsetY = (canvasH - spanH * scale) / 2 - minY * scale
   }
 
-  function snapValue(value, candidates, grid) {
-    var best = Math.round(value / grid) * grid
-    var bestDistance = Math.abs(value - best)
-    for (var i = 0; i < candidates.length; i++) {
-      var candidate = Number(candidates[i])
-      if (!isFinite(candidate)) continue
-      var distance = Math.abs(value - candidate)
-      if (distance < bestDistance) {
-        best = candidate
-        bestDistance = distance
-      }
-    }
-    return bestDistance <= 24 ? best : Math.round(value / grid) * grid
-  }
-
-  function snappedPosition(name, rawX, rawY) {
-    var monitor = layoutState[name]
-    if (!monitor) return { x: Math.round(rawX), y: Math.round(rawY) }
-
-    var xs = [0]
-    var ys = [0]
-    for (var i = 0; i < enabledLayoutMonitors.length; i++) {
-      var other = enabledLayoutMonitors[i]
-      if (!other || other.name === name) continue
-      xs.push(other.x)
-      xs.push(other.x + other.layoutWidth)
-      xs.push(other.x - monitor.layoutWidth)
-      ys.push(other.y)
-      ys.push(other.y + other.layoutHeight)
-      ys.push(other.y - monitor.layoutHeight)
-    }
-    return {
-      x: Math.round(snapValue(rawX, xs, 8)),
-      y: Math.round(snapValue(rawY, ys, 8))
-    }
-  }
-
   function moveMonitor(name, x, y) {
     var monitor = layoutState[name]
     if (!monitor || !monitor.enabled) return
+    // Edge snapping plus collision push-out live in the model so the drag
+    // can never place a display inside another one. A null result means the
+    // pointer is somewhere nothing fits (fully boxed in) — stay put.
+    var resolved = Model.resolveDrag(layoutMonitors, name, x, y)
+    if (!resolved) return
     var next = cloneMonitor(monitor)
-    next.x = Math.round(x)
-    next.y = Math.round(y)
+    next.x = resolved.x
+    next.y = resolved.y
     replaceMonitor(next)
+    snapX = resolved.snappedX
+    snapGuideX = resolved.x
+    snapY = resolved.snappedY
+    snapGuideY = resolved.y
     layoutDirty = true
     layoutStatusKey = ""
     layoutStatusDetail = ""
+  }
+
+  function endDragMonitor() {
+    dragMonitorName = ""
+    snapX = false
+    snapY = false
+    // Refit the canvas to the dropped arrangement so the whole layout stays
+    // in view after a long drag.
+    recomputeCanvas()
   }
 
   function setMonitorResolution(name, resolution) {
@@ -1750,17 +1740,38 @@ Panel {
                       var point = monitorCard.mapToItem(null, mouse.x, mouse.y)
                       var dx = (point.x - root.dragPressScene.x) / root.canvasScale
                       var dy = (point.y - root.dragPressScene.y) / root.canvasScale
-                      var snapped = root.snappedPosition(
-                        monitorCard.modelData, root.dragStartX + dx, root.dragStartY + dy)
-                      root.moveMonitor(monitorCard.modelData, snapped.x, snapped.y)
+                      root.moveMonitor(monitorCard.modelData,
+                        root.dragStartX + dx, root.dragStartY + dy)
                     }
 
                     onReleased: {
                       if (root.dragMonitorName === monitorCard.modelData)
-                        root.dragMonitorName = ""
+                        root.endDragMonitor()
                     }
                   }
                 }
+              }
+
+              // Snap guides: vertical/horizontal rules at the dragged card's
+              // snapped edge while a drag is in progress.
+              Rectangle {
+                visible: root.dragMonitorName !== "" && root.snapX
+                x: Math.round(root.canvasOffsetX + root.snapGuideX * root.canvasScale) - 1
+                y: 0
+                width: 2
+                height: arrangementCanvas.height
+                color: Commons.Color.accent
+                opacity: 0.65
+              }
+
+              Rectangle {
+                visible: root.dragMonitorName !== "" && root.snapY
+                y: Math.round(root.canvasOffsetY + root.snapGuideY * root.canvasScale) - 1
+                x: 0
+                height: 2
+                width: arrangementCanvas.width
+                color: Commons.Color.accent
+                opacity: 0.65
               }
 
               Text {
