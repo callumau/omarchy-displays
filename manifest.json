@@ -1,0 +1,29 @@
+{
+  "schemaVersion": 1,
+  "id": "io.github.callumau.displays",
+  "name": "Displays",
+  "version": "1.1.0",
+  "author": "Callum (callumau)",
+  "license": "MIT",
+  "description": "Arrange monitors, set resolution, refresh rate and primary, and restore layouts automatically for each connected monitor set",
+  "homepage": "https://github.com/callumau/omarchy-displays",
+  "repository": "https://github.com/callumau/omarchy-displays",
+  "kinds": [
+    "bar-widget",
+    "service"
+  ],
+  "entryPoints": {
+    "barWidget": "Panel.qml",
+    "service": "Service.qml"
+  },
+  "barWidget": {
+    "displayName": "Displays",
+    "description": "Arrange displays, set resolution, refresh rate and primary",
+    "category": "System",
+    "allowMultiple": false,
+    "defaultSection": "right"
+  },
+  "omarchy": {
+    "clonedFrom": "omarchy.monitor"
+  }
+}

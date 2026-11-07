@@ -1,0 +1,1895 @@
+import QtQuick
+import QtQuick.Controls
+import Quickshell
+import Quickshell.Io
+import qs.Ui
+import qs.Commons
+import qs.Commons as Commons
+import "Model.js" as Model
+
+Panel {
+  id: root
+  moduleName: "io.github.callumau.displays"
+  ipcTarget: "io.github.callumau.displays"
+  manageIpc: false
+
+  // manageIpc: false so this panel can own the single IpcHandler the target
+  // permits — needed for the brightness + state methods below.
+  property int brightnessPercent: 0
+  property int pendingBrightnessPercent: 0
+  property bool brightnessSetQueued: false
+  property bool brightnessAvailable: false
+  property string internalMonitor: ""
+  property string externalMonitor: ""
+  property string focusedMonitor: ""
+  property bool internalEnabled: false
+  property bool mirrorEnabled: false
+  property string monitorScale: ""
+  property var displays: []
+  property int enabledDisplayCount: 0
+
+  // ---- Layout tab: arrangement, resolution, refresh, presets ----
+  Commons.Translations { id: strings; directory: Qt.resolvedUrl("i18n") }
+
+  property string activeTab: "display"
+
+  // name -> monitor object. Replaced as a whole on every edit so the
+  // Repeater delegates keep a stable model (their names array) while their
+  // bound geometry updates during a drag.
+  property var layoutNames: []
+  property var layoutState: ({})
+  property string selectedLayoutName: ""
+  property real canvasScale: 1
+  property real canvasOffsetX: 0
+  property real canvasOffsetY: 0
+  property real canvasViewWidth: 0
+  property real canvasViewHeight: 0
+  property bool layoutDirty: false
+  property bool applyRunning: false
+  property bool acceptOverlapSnapshot: false
+  property string layoutStatusKey: ""
+  property string layoutStatusDetail: ""
+
+  // Drag state shared by the monitor cards.
+  property string dragMonitorName: ""
+  property point dragPressScene: Qt.point(0, 0)
+  property real dragStartX: 0
+  property real dragStartY: 0
+
+  readonly property string pluginDir: {
+    var url = Qt.resolvedUrl(".").toString()
+    if (url.indexOf("file://") !== 0) return ""
+    return decodeURIComponent(url.substring(7)).replace(/\/+$/, "")
+  }
+
+  readonly property var layoutMonitors: {
+    var list = []
+    for (var i = 0; i < layoutNames.length; i++) {
+      var monitor = layoutState[layoutNames[i]]
+      if (monitor) list.push(monitor)
+    }
+    return list
+  }
+
+  readonly property var enabledLayoutMonitors: {
+    var list = []
+    for (var i = 0; i < layoutMonitors.length; i++) {
+      if (layoutMonitors[i].enabled) list.push(layoutMonitors[i])
+    }
+    return list
+  }
+
+  readonly property var selectedMonitor: selectedLayoutName !== ""
+    ? (layoutState[selectedLayoutName] || null) : null
+
+  readonly property bool hasLayoutOverlap: Model.anyOverlap(layoutMonitors)
+
+  // The first overlapping pair, so the warning names the displays instead of
+  // leaving the user to compare rectangles.
+  readonly property string overlapNames: {
+    var monitors = enabledLayoutMonitors
+    for (var i = 0; i < monitors.length; i++) {
+      for (var j = i + 1; j < monitors.length; j++) {
+        if (Model.overlaps(monitors[i], monitors[j]))
+          return monitors[i].name + " ↔ " + monitors[j].name
+      }
+    }
+    return ""
+  }
+
+  readonly property var resolutionOptions: {
+    var monitor = selectedMonitor
+    if (!monitor) return []
+    var resolutions = Model.resolutionsFor(monitor.availableModes)
+    if (resolutions.indexOf(monitor.pendingResolution) < 0)
+      resolutions.unshift(monitor.pendingResolution)
+    return resolutions
+  }
+
+  readonly property var refreshOptions: {
+    var monitor = selectedMonitor
+    if (!monitor) return []
+    var rates = Model.refreshRatesFor(monitor.availableModes, monitor.pendingResolution)
+    if (rates.indexOf(monitor.pendingRefresh) < 0)
+      rates.unshift(monitor.pendingRefresh)
+    return rates
+  }
+
+  readonly property var resolutionDropdownOptions: {
+    var options = []
+    for (var i = 0; i < resolutionOptions.length; i++) {
+      var parts = String(resolutionOptions[i]).split("x")
+      options.push({
+        value: resolutionOptions[i],
+        label: parts.length === 2 ? parts[0] + " × " + parts[1] : resolutionOptions[i]
+      })
+    }
+    return options
+  }
+
+  readonly property var refreshDropdownOptions: {
+    var options = []
+    for (var i = 0; i < refreshOptions.length; i++) {
+      var value = String(refreshOptions[i])
+      var decimals = value.indexOf(".") >= 0 ? 2 : 0
+      options.push({
+        value: value,
+        label: Commons.I18n.formatNumber(Number(value), decimals) + " Hz"
+      })
+    }
+    return options
+  }
+
+  // Carry sub-notch touchpad deltas between wheel events.
+  property real wheelAccumulator: 0
+
+  // Cursor model shared by keyboard and mouse. Sections:
+  //   "brightness" - single slider row, selectedIndex = -1 sentinel
+  //                  (mirrors Audio's slider rows). Only present if a
+  //                  controllable backlight was detected.
+  //   "scale"      - 6 Button scale presets; treated as a single
+  //                  horizontal row from j/k's perspective. h/l moves
+  //                  between presets, identical to bluetooth's header.
+  //   "monitors"   - vertical display row list for enabling/disabling displays;
+  //                  j/k walks each row.
+  // Mouse hover on a target updates root state via the components' `hovered`
+  // signal so keyboard cursor and pointer share one highlight.
+  readonly property var scalePresets: ["1", "1.25", "1.6", "2", "3", "4"]
+  readonly property var scaleValues: {
+    for (var i = 0; i < displays.length; i++) {
+      var display = displays[i]
+      if (display && display.focused)
+        return Model.availableScales(scalePresets, display.width, display.height)
+    }
+    return scalePresets
+  }
+  property string focusSection: "scale"
+  property int selectedIndex: 0
+  property bool cursorActive: false
+
+  // Text size slider — curated macOS-style notches (px). The panel snaps to
+  // these stops; the CLI (omarchy-display-text-size) accepts any integer in range.
+  readonly property var textSizeStops: [9, 10, 11, 12, 14, 16, 20]
+  // While a change is in flight, the chosen stop index overrides the live
+  // base-size so the knob doesn't snap back during the file round-trip. -1 =
+  // no pending change; follow Style.font.baseSize.
+  property int textSizePreviewIndex: -1
+
+  // A text-size change reflows the whole panel (both font and spacing scale),
+  // which slides rows under a stationary pointer and fires synthetic hover.
+  // While true, hover is not allowed to hijack the keyboard focus section —
+  // otherwise h/l on the text-size slider can jump focus to another row.
+  property bool reflowingText: false
+  function markReflowing() {
+    root.reflowingText = true
+    reflowSettle.restart()
+  }
+
+  readonly property var visibleSections: {
+    if (activeTab !== "display") return []
+    var list = []
+    if (brightnessAvailable) list.push("brightness")
+    list.push("textsize")
+    list.push("scale")
+    if (displays.length > 1) list.push("monitors")
+    return list
+  }
+
+  function sectionCount(section) {
+    if (section === "brightness") return 0  // only the slider sentinel at -1
+    if (section === "textsize") return 0    // slider sentinel at -1, like brightness
+    if (section === "scale") return scaleValues.length
+    if (section === "monitors") return displays.length
+    return 0
+  }
+
+  function sectionIsSingleRow(section) {
+    // brightness and text size are lone sliders; scale presets sit horizontally.
+    return section === "brightness" || section === "textsize" || section === "scale"
+  }
+
+  function sectionFirstIndex(section) {
+    if (section === "brightness" || section === "textsize") return -1
+    return 0
+  }
+
+  function moveCursor(delta) {
+    var sections = visibleSections
+    if (!sections || sections.length === 0) return
+    var sIdx = sections.indexOf(focusSection)
+    if (sIdx < 0) {
+      focusSection = sections[0]
+      selectedIndex = sectionFirstIndex(focusSection)
+      return
+    }
+    var inSingleRow = sectionIsSingleRow(focusSection)
+    var max = inSingleRow ? 0 : sectionCount(focusSection) - 1
+
+    if (delta > 0) {
+      if (!inSingleRow && selectedIndex < max) { selectedIndex = selectedIndex + 1; return }
+      if (sIdx < sections.length - 1) {
+        focusSection = sections[sIdx + 1]
+        selectedIndex = sectionFirstIndex(focusSection)
+      }
+    } else {
+      if (!inSingleRow && selectedIndex > 0) { selectedIndex = selectedIndex - 1; return }
+      if (sIdx > 0) {
+        var prev = sections[sIdx - 1]
+        focusSection = prev
+        // Coming up from below — land on the last navigable row of the prev
+        // section, or its sentinel for single-row sections.
+        selectedIndex = sectionIsSingleRow(prev) ? sectionFirstIndex(prev) : sectionCount(prev) - 1
+      }
+    }
+  }
+
+  // h/l: in scale section, walks the preset row; everywhere else, no-op
+  // because adjustBrightness handles horizontal motion on the brightness
+  // slider.
+  function moveCursorH(delta) {
+    if (focusSection !== "scale") return
+    var next = selectedIndex + delta
+    if (next < 0) next = 0
+    if (next > scaleValues.length - 1) next = scaleValues.length - 1
+    selectedIndex = next
+  }
+
+  function adjustBrightness(delta) {
+    if (focusSection !== "brightness") return
+    if (!brightnessAvailable) return
+    setBrightness(root.brightnessPercent + delta)
+  }
+
+  function activateCursor() {
+    if (focusSection === "scale" && selectedIndex >= 0 && selectedIndex < scaleValues.length) {
+      setScale(scaleValues[selectedIndex])
+      return
+    }
+    if (focusSection === "monitors" && selectedIndex >= 0 && selectedIndex < displays.length) {
+      var d = displays[selectedIndex]
+      if (d) toggleDisplay(d.name, d.enabled)
+    }
+    // brightness: no separate action; the slider value is the action.
+  }
+
+  function clampCursor() {
+    var sections = visibleSections
+    if (!sections || !sections.length) return
+    if (sections.indexOf(focusSection) < 0) {
+      focusSection = sections[0]
+      selectedIndex = sectionFirstIndex(focusSection)
+      return
+    }
+    var count = sectionCount(focusSection)
+    if (sectionIsSingleRow(focusSection)) {
+      // brightness/text size use the -1 sentinel; scale clamps into the presets.
+      if (focusSection === "brightness" || focusSection === "textsize") selectedIndex = -1
+      else if (selectedIndex < 0 || selectedIndex >= count) selectedIndex = 0
+      return
+    }
+    if (count === 0) {
+      var sIdx = sections.indexOf(focusSection)
+      focusSection = sIdx > 0 ? sections[sIdx - 1] : sections[0]
+      selectedIndex = sectionFirstIndex(focusSection)
+      return
+    }
+    if (selectedIndex > count - 1) selectedIndex = count - 1
+    if (selectedIndex < 0) selectedIndex = 0
+  }
+
+  // Keep the keyboard-focused row inside the viewport when the panel grows
+  // taller than its allotted height (lots of displays). Mirrors audio's
+  // ensureCursorVisible helper.
+  function ensureCursorVisible(item) {
+    var scrollArea = panel.loadedContent ? panel.loadedContent.scrollArea : null
+    if (!item || !scrollArea) return
+    var flick = scrollArea.contentItem
+    if (!flick || flick.contentY === undefined) return
+    var pt = item.mapToItem(flick.contentItem || flick, 0, 0)
+    var top = pt.y
+    var bottom = top + (item.height || 0)
+    var viewTop = flick.contentY
+    var viewBottom = viewTop + flick.height
+    var margin = 6
+    if (top < viewTop + margin) flick.contentY = Math.max(0, top - margin)
+    else if (bottom > viewBottom - margin)
+      flick.contentY = bottom + margin - flick.height
+  }
+
+  function brightnessIpc(percent) {
+    var value = Number(percent)
+    root.setBrightness(value)
+    return "got " + root.pendingBrightnessPercent
+  }
+
+  function stateIpc() {
+    return JSON.stringify({
+      brightness: root.brightnessPercent,
+      brightnessAvailable: root.brightnessAvailable,
+      focusedMonitor: root.focusedMonitor,
+      scale: root.monitorScale,
+      displays: root.displays,
+      activeTab: root.activeTab,
+      layoutDirty: root.layoutDirty,
+      overlap: root.hasLayoutOverlap,
+      layout: root.layoutMonitors.map(function(monitor) {
+        return {
+          name: monitor.name,
+          x: monitor.x,
+          y: monitor.y,
+          width: monitor.layoutWidth,
+          height: monitor.layoutHeight,
+          enabled: monitor.enabled,
+          pendingResolution: monitor.pendingResolution,
+          pendingRefresh: monitor.pendingRefresh
+        }
+      })
+    })
+  }
+
+  // A target of its own: the bar host also registers the plugin id, and the
+  // first handler wins, so extra methods would be unreachable there.
+  ShellIpc {
+    target: "io.github.callumau.displays.panel"
+
+    function brightness(percent: string): string { return root.brightnessIpc(percent) }
+    function state(): string { return root.stateIpc() }
+    function layout(): string {
+      root.activeTab = "layout"
+      root.open()
+      return "ok"
+    }
+    function display(): string {
+      root.activeTab = "display"
+      root.open()
+      return "ok"
+    }
+    function open() { root.open() }
+    function close() { root.close() }
+    function toggle() { root.toggle() }
+    function show() { root.open() }
+    function hide() { root.close() }
+  }
+
+  function refresh() {
+    if (!stateProc.running) stateProc.running = true
+    if (!layoutDirty && !layoutProc.running) layoutProc.running = true
+  }
+
+  function refreshLayout() {
+    if (!layoutProc.running) layoutProc.running = true
+  }
+
+  function setBrightness(value) {
+    var percent = Model.clampBrightness(value)
+    root.brightnessPercent = percent
+    root.pendingBrightnessPercent = percent
+
+    if (setBrightnessProc.running) {
+      root.brightnessSetQueued = true
+      return
+    }
+
+    root.brightnessSetQueued = false
+    setBrightnessProc.command = ["omarchy-brightness-display", "--no-osd", "--monitor", root.focusedMonitor, percent + "%"]
+    setBrightnessProc.running = true
+  }
+
+  function previewBrightness(value) {
+    root.brightnessPercent = Model.clampBrightness(value)
+    brightnessDebounce.restart()
+  }
+
+  function showBrightnessOsd(percent) {
+    if (!bar || !bar.shell) return
+    bar.shell.summon("omarchy.osd", JSON.stringify({
+      icon: "brightness",
+      value: percent
+    }))
+  }
+
+  function normalizeScale(scale) {
+    return Model.normalizeScale(scale)
+  }
+
+  function activeScaleIndex() {
+    for (var i = 0; i < displays.length; i++) {
+      var display = displays[i]
+      if (display && display.focused)
+        return Model.matchingScaleIndex(scaleValues, monitorScale, display.width, display.height)
+    }
+    return -1
+  }
+
+  function effectiveScale(scale) {
+    for (var i = 0; i < displays.length; i++) {
+      var display = displays[i]
+      if (display && display.focused)
+        return Model.cleanScale(scale, display.width, display.height)
+    }
+    return normalizeScale(scale)
+  }
+
+  // Playful mood-name for a given brightness percent. Bands intentionally
+  // span ~10–20 points so casual tweaks change the label, while small
+  // nudges within one band don't.
+  function brightnessName(percent) {
+    return Model.brightnessName(percent, Commons.I18n.t)
+  }
+
+  function updateDisplays(displaysJson) {
+    var parsed = Model.parseDisplays(displaysJson)
+    root.displays = parsed.displays
+    root.enabledDisplayCount = parsed.enabledDisplayCount
+  }
+
+  function toggleDisplay(name, enabled) {
+    if (!name) return
+    if (enabled && root.enabledDisplayCount <= 1) return
+
+    // hyprctl keyword is rejected under the Lua config ("non-legacy parsers"),
+    // so drive the monitor through the hl.monitor eval API instead.
+    var output = '"' + name.replace(/[\\"]/g, "\\$&") + '"'
+    // hl.monitor updates the existing rule. Keep its mode, position and scale
+    // when bringing the display back.
+    var expr = enabled
+      ? 'hl.monitor({ output = ' + output + ', disabled = true })'
+      : 'hl.monitor({ output = ' + output + ', disabled = false })'
+    actionProc.command = ["hyprctl", "eval", expr]
+    if (!actionProc.running) actionProc.running = true
+  }
+
+  function cloneMonitor(monitor) {
+    var copy = {}
+    for (var key in monitor) copy[key] = monitor[key]
+    return copy
+  }
+
+  function replaceMonitor(monitor) {
+    if (!monitor || !monitor.name) return
+    var next = {}
+    for (var key in layoutState) next[key] = layoutState[key]
+    next[monitor.name] = monitor
+    layoutState = next
+  }
+
+  function setLayoutMonitors(monitors) {
+    if (!monitors || monitors.length === 0) return
+
+    // Applying a swap briefly puts one display on top of another. Do not
+    // replace a healthy, unsaved-free layout with that in-between snapshot;
+    // re-read once the compositor has settled, and accept it if it persists.
+    if (Model.anyOverlap(monitors) && !layoutDirty && !hasLayoutOverlap
+        && !acceptOverlapSnapshot) {
+      acceptOverlapSnapshot = true
+      overlapRetry.restart()
+      return
+    }
+    acceptOverlapSnapshot = false
+
+    var next = {}
+    var names = []
+    var focusName = ""
+    for (var i = 0; i < monitors.length; i++) {
+      var monitor = monitors[i]
+      next[monitor.name] = monitor
+      names.push(monitor.name)
+      if (monitor.focused) focusName = monitor.name
+    }
+
+    if (names.indexOf(selectedLayoutName) < 0)
+      selectedLayoutName = focusName !== "" ? focusName : names[0]
+
+    var sameNames = names.length === layoutNames.length
+    if (sameNames) {
+      for (var j = 0; j < names.length; j++) {
+        if (names[j] !== layoutNames[j]) {
+          sameNames = false
+          break
+        }
+      }
+    }
+
+    layoutState = next
+    if (!sameNames) layoutNames = names
+    layoutDirty = false
+    layoutStatusKey = ""
+    layoutStatusDetail = ""
+    recomputeCanvas()
+  }
+
+  function selectLayoutMonitor(name) {
+    if (!name) return
+    selectedLayoutName = name
+  }
+
+  function recomputeCanvas() {
+    var monitors = enabledLayoutMonitors
+    if (monitors.length === 0) {
+      canvasScale = 1
+      canvasOffsetX = 0
+      canvasOffsetY = 0
+      return
+    }
+
+    var minX = monitors[0].x
+    var minY = monitors[0].y
+    var maxX = monitors[0].x + monitors[0].layoutWidth
+    var maxY = monitors[0].y + monitors[0].layoutHeight
+    for (var i = 1; i < monitors.length; i++) {
+      minX = Math.min(minX, monitors[i].x)
+      minY = Math.min(minY, monitors[i].y)
+      maxX = Math.max(maxX, monitors[i].x + monitors[i].layoutWidth)
+      maxY = Math.max(maxY, monitors[i].y + monitors[i].layoutHeight)
+    }
+
+    var canvasW = canvasViewWidth > 0 ? canvasViewWidth : Style.space(360)
+    var canvasH = canvasViewHeight > 0 ? canvasViewHeight : Style.space(190)
+    var pad = Style.space(10)
+    var spanW = Math.max(1, maxX - minX)
+    var spanH = Math.max(1, maxY - minY)
+    var scale = Math.min(0.22, (canvasW - pad * 2) / spanW, (canvasH - pad * 2) / spanH)
+    if (!isFinite(scale) || scale <= 0) scale = 0.1
+
+    canvasScale = scale
+    canvasOffsetX = (canvasW - spanW * scale) / 2 - minX * scale
+    canvasOffsetY = (canvasH - spanH * scale) / 2 - minY * scale
+  }
+
+  function snapValue(value, candidates, grid) {
+    var best = Math.round(value / grid) * grid
+    var bestDistance = Math.abs(value - best)
+    for (var i = 0; i < candidates.length; i++) {
+      var candidate = Number(candidates[i])
+      if (!isFinite(candidate)) continue
+      var distance = Math.abs(value - candidate)
+      if (distance < bestDistance) {
+        best = candidate
+        bestDistance = distance
+      }
+    }
+    return bestDistance <= 24 ? best : Math.round(value / grid) * grid
+  }
+
+  function snappedPosition(name, rawX, rawY) {
+    var monitor = layoutState[name]
+    if (!monitor) return { x: Math.round(rawX), y: Math.round(rawY) }
+
+    var xs = [0]
+    var ys = [0]
+    for (var i = 0; i < enabledLayoutMonitors.length; i++) {
+      var other = enabledLayoutMonitors[i]
+      if (!other || other.name === name) continue
+      xs.push(other.x)
+      xs.push(other.x + other.layoutWidth)
+      xs.push(other.x - monitor.layoutWidth)
+      ys.push(other.y)
+      ys.push(other.y + other.layoutHeight)
+      ys.push(other.y - monitor.layoutHeight)
+    }
+    return {
+      x: Math.round(snapValue(rawX, xs, 8)),
+      y: Math.round(snapValue(rawY, ys, 8))
+    }
+  }
+
+  function moveMonitor(name, x, y) {
+    var monitor = layoutState[name]
+    if (!monitor || !monitor.enabled) return
+    var next = cloneMonitor(monitor)
+    next.x = Math.round(x)
+    next.y = Math.round(y)
+    replaceMonitor(next)
+    layoutDirty = true
+    layoutStatusKey = ""
+    layoutStatusDetail = ""
+  }
+
+  function setMonitorResolution(name, resolution) {
+    var monitor = layoutState[name]
+    if (!monitor) return
+    var next = cloneMonitor(monitor)
+    next.pendingResolution = resolution
+
+    var parts = String(resolution).split("x")
+    var pendingWidth = parseInt(parts[0], 10)
+    var pendingHeight = parseInt(parts[1], 10)
+    if (pendingWidth > 0 && pendingHeight > 0) {
+      next.pendingWidth = pendingWidth
+      next.pendingHeight = pendingHeight
+      next.layoutWidth = Math.max(1, Math.round(pendingWidth / next.scale))
+      next.layoutHeight = Math.max(1, Math.round(pendingHeight / next.scale))
+    }
+
+    var rates = Model.refreshRatesFor(next.availableModes, resolution)
+    if (rates.indexOf(next.pendingRefresh) < 0)
+      next.pendingRefresh = rates.length > 0 ? rates[0] : next.pendingRefresh
+    replaceMonitor(next)
+    layoutDirty = true
+    layoutStatusKey = ""
+    layoutStatusDetail = ""
+    recomputeCanvas()
+  }
+
+  function setMonitorRefresh(name, refresh) {
+    var monitor = layoutState[name]
+    if (!monitor) return
+    var next = cloneMonitor(monitor)
+    next.pendingRefresh = refresh
+    replaceMonitor(next)
+    layoutDirty = true
+    layoutStatusKey = ""
+    layoutStatusDetail = ""
+  }
+
+  function setMonitorEnabled(name, enabled) {
+    var monitor = layoutState[name]
+    if (!monitor) return
+    if (!enabled && enabledLayoutMonitors.length <= 1) return
+    var next = cloneMonitor(monitor)
+    var wasEnabled = next.enabled
+    next.enabled = enabled
+    if (enabled && !wasEnabled) {
+      var spot = Model.freePosition(enabledLayoutMonitors, name)
+      next.x = spot.x
+      next.y = spot.y
+    }
+    replaceMonitor(next)
+    layoutDirty = true
+    layoutStatusKey = ""
+    layoutStatusDetail = ""
+    recomputeCanvas()
+  }
+
+  function toggleLayoutMonitor(name) {
+    var monitor = layoutState[name]
+    if (!monitor) return
+    setMonitorEnabled(name, !monitor.enabled)
+  }
+
+  function arrangeMonitors(reverse) {
+    var order = Model.sortedByPosition(enabledLayoutMonitors)
+    if (reverse) order.reverse()
+
+    var next = {}
+    for (var key in layoutState) next[key] = layoutState[key]
+    var x = 0
+    for (var i = 0; i < order.length; i++) {
+      var monitor = cloneMonitor(order[i])
+      monitor.x = x
+      monitor.y = 0
+      next[monitor.name] = monitor
+      x += monitor.layoutWidth
+    }
+    layoutState = next
+    layoutDirty = true
+    layoutStatusKey = ""
+    layoutStatusDetail = ""
+    recomputeCanvas()
+  }
+
+  function makePrimary(name) {
+    var monitor = layoutState[name]
+    if (!monitor || !monitor.enabled) return
+
+    var order = Model.sortedByPosition(enabledLayoutMonitors)
+    var next = {}
+    for (var key in layoutState) next[key] = layoutState[key]
+
+    var primary = cloneMonitor(monitor)
+    primary.x = 0
+    primary.y = 0
+    next[primary.name] = primary
+
+    var x = primary.layoutWidth
+    for (var i = 0; i < order.length; i++) {
+      if (order[i].name === name) continue
+      var other = cloneMonitor(order[i])
+      other.x = x
+      other.y = 0
+      next[other.name] = other
+      x += other.layoutWidth
+    }
+    layoutState = next
+    layoutDirty = true
+    layoutStatusKey = ""
+    layoutStatusDetail = ""
+    recomputeCanvas()
+  }
+
+  function revertLayout() {
+    layoutDirty = false
+    layoutStatusKey = ""
+    layoutStatusDetail = ""
+    refreshLayout()
+  }
+
+  function applyLayout() {
+    if (applyProc.running) return
+    if (hasLayoutOverlap) return
+    if (enabledLayoutMonitors.length === 0) return
+
+    var rules = []
+    for (var i = 0; i < layoutNames.length; i++) {
+      var monitor = layoutState[layoutNames[i]]
+      if (!monitor) continue
+      if (!monitor.enabled) {
+        rules.push({
+          name: monitor.name,
+          identity: monitor.identity,
+          description: monitor.description,
+          disabled: true
+        })
+      } else {
+        rules.push({
+          name: monitor.name,
+          identity: monitor.identity,
+          description: monitor.description,
+          mode: Model.modeString(monitor.pendingResolution, monitor.pendingRefresh),
+          position: Math.round(monitor.x) + "x" + Math.round(monitor.y),
+          scale: monitor.scale,
+          transform: monitor.transform,
+          disabled: false
+        })
+      }
+    }
+
+    if (rules.length === 0 || pluginDir === "") {
+      layoutStatusKey = "layout.failed"
+      layoutStatusDetail = pluginDir === "" ? "plugin path unavailable" : ""
+      return
+    }
+
+    layoutStatusKey = "layout.applying"
+    layoutStatusDetail = ""
+    applyRunning = true
+    applyProc.command = ["bash", pluginDir + "/apply-displays.sh", JSON.stringify(rules), "--remember"]
+    applyProc.running = true
+  }
+
+  function setScale(scale) {
+    actionProc.command = ["bash", "-c", "omarchy-hyprland-monitor-scaling " + scale]
+    if (!actionProc.running) actionProc.running = true
+  }
+
+  // ---- Text size (shell base font + GTK text-scaling, via one CLI) ----
+  function nearestTextStop(px) {
+    var best = 0
+    var bestDist = 1e9
+    for (var i = 0; i < textSizeStops.length; i++) {
+      var d = Math.abs(textSizeStops[i] - px)
+      if (d < bestDist) { bestDist = d; best = i }
+    }
+    return best
+  }
+
+  // Effective stop index: the pending choice while a change is in flight,
+  // otherwise whatever Style's live base-size rounds to.
+  function currentTextIndex() {
+    return textSizePreviewIndex >= 0 ? textSizePreviewIndex : nearestTextStop(Style.font.baseSize)
+  }
+
+  // px shown in the header: the pending stop if any, else the true base-size
+  // (which may be an off-notch value set from the CLI).
+  function displayedTextPx() {
+    return textSizePreviewIndex >= 0 ? textSizeStops[textSizePreviewIndex] : Style.font.baseSize
+  }
+
+  function setTextSize(px) {
+    textScaleProc.command = ["omarchy-display-text-size", String(px)]
+    if (!textScaleProc.running) textScaleProc.running = true
+  }
+
+  function adjustTextSize(deltaSteps) {
+    var idx = currentTextIndex() + deltaSteps
+    if (idx < 0) idx = 0
+    if (idx > textSizeStops.length - 1) idx = textSizeStops.length - 1
+    markReflowing()
+    textSizePreviewIndex = idx
+    setTextSize(textSizeStops[idx])
+  }
+
+  implicitWidth: button.implicitWidth
+  implicitHeight: button.implicitHeight
+
+  Component.onCompleted: refresh()
+
+  // KeyboardPanel primes focus at open-time, so SUPER-bound IPC summons land
+  // with j/k ready to navigate. Keep a default landing point, but don't paint
+  // the cursor until hover or the first navigation key.
+  onOpenedChanged: {
+    if (opened) {
+      refresh()
+      if (brightnessAvailable) {
+        focusSection = "brightness"
+        selectedIndex = -1
+      } else {
+        focusSection = "scale"
+        selectedIndex = 0
+      }
+      cursorActive = false
+    }
+  }
+
+  onBrightnessAvailableChanged: clampCursor()
+  onDisplaysChanged: clampCursor()
+  onScaleValuesChanged: clampCursor()
+  onVisibleSectionsChanged: clampCursor()
+  onActiveTabChanged: {
+    clampCursor()
+    if (activeTab === "layout" && !layoutDirty) refreshLayout()
+  }
+
+  // Only poll while the panel is open; the bar glyph tracks monitor count via
+  // Quickshell.screens, and open-time refresh + Component.onCompleted cover the
+  // rest. External brightness changes are reflected whenever the panel is open.
+  Timer {
+    interval: 5000
+    running: root.opened
+    repeat: true
+    onTriggered: root.refresh()
+  }
+
+  Timer {
+    id: overlapRetry
+    interval: 1200
+    repeat: false
+    onTriggered: root.refreshLayout()
+  }
+
+  Process {
+    id: layoutProc
+    command: ["hyprctl", "-j", "monitors", "all"]
+    stdout: StdioCollector {
+      waitForEnd: true
+      onStreamFinished: root.setLayoutMonitors(Model.parseMonitors(text))
+    }
+  }
+
+  Process {
+    id: applyProc
+    stdout: StdioCollector { id: applyStdout; waitForEnd: true }
+    stderr: StdioCollector { id: applyStderr; waitForEnd: true }
+    onExited: function(exitCode) {
+      root.applyRunning = false
+      if (exitCode === 0) {
+        root.layoutStatusKey = "layout.applied"
+        root.layoutStatusDetail = ""
+        root.layoutDirty = false
+        root.refresh()
+      } else {
+        root.layoutStatusKey = "layout.failed"
+        root.layoutStatusDetail = String(applyStderr.text || "").trim().slice(0, 160)
+      }
+    }
+  }
+
+  Process {
+    id: stateProc
+    command: ["omarchy-monitor-state"]
+    stdout: StdioCollector {
+      waitForEnd: true
+      onStreamFinished: {
+        var lines = String(text || "").split("\n")
+        var brightness = String(lines[0] || "").trim()
+        root.brightnessAvailable = brightness !== "unavailable" && brightness !== ""
+        root.brightnessPercent = root.brightnessAvailable ? Math.max(0, Math.min(100, parseInt(brightness, 10))) : 0
+        root.internalMonitor = String(lines[1] || "").trim()
+        root.externalMonitor = String(lines[2] || "").trim()
+        root.internalEnabled = String(lines[3] || "").trim() !== ""
+        root.mirrorEnabled = String(lines[4] || "").trim() === root.externalMonitor && root.externalMonitor !== ""
+        root.focusedMonitor = String(lines[5] || "").trim()
+        root.monitorScale = root.normalizeScale(String(lines[6] || "").trim())
+        root.updateDisplays(String(lines[7] || "[]").trim())
+      }
+    }
+  }
+
+  Timer {
+    id: brightnessDebounce
+    interval: 180
+    repeat: false
+    onTriggered: root.setBrightness(root.brightnessPercent)
+  }
+
+  Process {
+    id: setBrightnessProc
+    stdout: StdioCollector { waitForEnd: true }
+    // Do NOT call refresh() after a brightness set completes. The local
+    // brightnessPercent we just wrote is authoritative; re-reading via
+    // `omarchy-brightness-display` races the hardware/driver and can
+    // return an empty string, which the parser then coerces to 0 —
+    // visible as a "bounce to zero" after h/l keypresses. External
+    // brightness changes are still picked up by the 5s periodic refresh,
+    // the open-time refresh, and Component.onCompleted.
+    onRunningChanged: {
+      if (running) return
+      if (root.brightnessSetQueued) {
+        root.setBrightness(root.pendingBrightnessPercent)
+      }
+    }
+  }
+
+  Process {
+    id: actionProc
+    stdout: StdioCollector { waitForEnd: true }
+    onRunningChanged: if (!running) root.refresh()
+  }
+
+  // Applies text size via the CLI, which rewrites the shell override file;
+  // Style picks the new base-size up through its own file watch, so there's
+  // nothing to refresh here.
+  Process {
+    id: textScaleProc
+    stdout: StdioCollector { waitForEnd: true }
+  }
+
+  // Clears the hover-suppression flag once the reflow triggered by a text-size
+  // change has settled.
+  Timer {
+    id: reflowSettle
+    interval: 300
+    repeat: false
+    onTriggered: root.reflowingText = false
+  }
+
+  // Once Style's base-size catches up to the pending choice, drop the preview
+  // so the slider tracks the live value again. The change itself reflows the
+  // panel, so suppress hover for a beat while it lands.
+  Connections {
+    target: Style
+    function onFontBaseSizeChanged() {
+      root.markReflowing()
+      if (root.textSizePreviewIndex >= 0
+          && root.nearestTextStop(Style.font.baseSize) === root.textSizePreviewIndex)
+        root.textSizePreviewIndex = -1
+    }
+  }
+
+  BarIconButton {
+    id: button
+    anchors.fill: parent
+    bar: root.bar
+    text: Quickshell.screens.length > 1 ? "󰍺" : "󰍹"
+    onPressed: function(b) { root.toggle() }
+    onWheelMoved: function(delta) {
+      if (!root.brightnessAvailable) return
+      var wheel = Util.wheelSteps(root.wheelAccumulator, delta)
+      root.wheelAccumulator = wheel.remainder
+      if (wheel.steps === 0) return
+      root.setBrightness(root.brightnessPercent + wheel.steps * 5)
+      root.showBrightnessOsd(root.brightnessPercent)
+    }
+  }
+
+  KeyboardPanel {
+    id: panel
+    anchorItem: button
+    owner: root
+    bar: root.bar
+    open: root.opened
+    focusTarget: panel.loadedContent
+    contentWidth: panel.fittedContentWidth(Style.space(420))
+    contentHeight: panel.fittedContentHeight(panel.loadedContentHeight, Style.space(760))
+
+    content: PanelKeyCatcher {
+      id: keyCatcher
+      property alias scrollArea: scrollArea
+      implicitHeight: panelColumn.implicitHeight
+      anchors.fill: parent
+      onMoveRequested: function(dx, dy) {
+        if (!root.cursorActive) { root.cursorActive = true; return }
+        if (dy !== 0) root.moveCursor(dy)
+        else if (dx !== 0) {
+          if (root.focusSection === "brightness") root.adjustBrightness(dx * 5)
+          else if (root.focusSection === "textsize") root.adjustTextSize(dx)
+          else if (root.focusSection === "scale") root.moveCursorH(dx)
+        }
+      }
+      onActivateRequested: if (root.cursorActive) root.activateCursor()
+      onCloseRequested: root.close()
+      onTabRequested: function(direction) { root.switchPanel(direction) }
+
+      ScrollView {
+        id: scrollArea
+        anchors.fill: parent
+        clip: true
+        ScrollBar.horizontal.policy: ScrollBar.AlwaysOff
+        ScrollBar.vertical.policy: panelColumn.implicitHeight > height ? ScrollBar.AsNeeded : ScrollBar.AlwaysOff
+        Binding {
+          target: scrollArea.contentItem
+          property: "interactive"
+          value: panelColumn.implicitHeight > scrollArea.height
+        }
+
+        Column {
+          id: panelColumn
+          width: scrollArea.availableWidth
+          spacing: Style.space(14)
+
+          // ---------- Hero: display icon · title/status ----------
+          Item {
+            width: parent.width
+            implicitHeight: Math.max(heroIcon.implicitHeight, heroLabels.implicitHeight)
+
+            Text {
+              id: heroIcon
+              textFormat: Text.PlainText
+              text: root.displays.length > 1 ? "󰍺" : "󰍹"
+              color: root.bar.foreground
+              font.family: root.bar.fontFamily
+              font.pixelSize: Style.font.display
+              anchors.left: parent.left
+              anchors.verticalCenter: parent.verticalCenter
+            }
+
+            Column {
+              id: heroLabels
+              anchors.left: heroIcon.right
+              anchors.leftMargin: Style.space(14)
+              anchors.right: parent.right
+              anchors.verticalCenter: parent.verticalCenter
+              spacing: Style.space(2)
+
+              Text {
+                text: root.activeTab === "layout"
+                  ? strings.t("layout.title")
+                  : Commons.I18n.t("monitor.display")
+                textFormat: Text.PlainText
+                color: root.bar.foreground
+                font.family: root.bar.fontFamily
+                font.pixelSize: Style.font.title
+                font.bold: true
+                elide: Text.ElideRight
+                width: parent.width
+              }
+
+              Text {
+                id: heroLabel
+                textFormat: Text.PlainText
+                text: {
+                  if (root.activeTab === "layout")
+                    return strings.t("layout.hint").toUpperCase()
+                  if (root.brightnessAvailable) {
+                    return root.brightnessName(brightnessSlider.dragging ? brightnessSlider.liveValue : root.brightnessPercent).toUpperCase()
+                  }
+                  return Commons.I18n.t("monitor.fixedBrightness")
+                }
+                color: Qt.darker(root.bar.foreground, 1.4)
+                font.family: root.bar.fontFamily
+                font.pixelSize: Style.font.caption
+                font.bold: true
+                font.letterSpacing: 1.2
+                elide: Text.ElideRight
+                width: parent.width
+              }
+            }
+          }
+
+          // ---------- Tabs ----------
+          Row {
+            id: tabRow
+            width: parent.width
+            spacing: Style.spacing.xs
+
+            Button {
+              width: (tabRow.width - tabRow.spacing) / 2
+              text: strings.t("tab.display")
+              fontSize: Style.font.body
+              foreground: root.bar.foreground
+              fontFamily: root.bar.fontFamily
+              horizontalPadding: Style.spacing.sm
+              verticalPadding: Style.spacing.controlPaddingY
+              bordered: true
+              selected: root.activeTab === "display"
+              onClicked: root.activeTab = "display"
+            }
+
+            Button {
+              width: (tabRow.width - tabRow.spacing) / 2
+              text: strings.t("tab.layout")
+              fontSize: Style.font.body
+              foreground: root.bar.foreground
+              fontFamily: root.bar.fontFamily
+              horizontalPadding: Style.spacing.sm
+              verticalPadding: Style.spacing.controlPaddingY
+              bordered: true
+              selected: root.activeTab === "layout"
+              onClicked: root.activeTab = "layout"
+            }
+          }
+
+          // ---------- Brightness ----------
+          PanelSeparator {
+            visible: root.activeTab === "display" && root.brightnessAvailable
+            foreground: root.bar.foreground
+          }
+
+          Column {
+            visible: root.activeTab === "display" && root.brightnessAvailable
+            width: parent.width
+            spacing: Style.space(6)
+
+            Item {
+              width: parent.width
+              implicitHeight: Math.max(brightnessHeader.implicitHeight, brightnessPercent.implicitHeight)
+
+              PanelSectionHeader {
+                id: brightnessHeader
+                text: Commons.I18n.t("monitor.brightness")
+                foreground: root.bar.foreground
+                fontFamily: root.bar.fontFamily
+                anchors.left: parent.left
+                anchors.verticalCenter: parent.verticalCenter
+              }
+
+              Text {
+                id: brightnessPercent
+                textFormat: Text.PlainText
+                text: Commons.I18n.formatNumber(Math.round(brightnessSlider.dragging ? brightnessSlider.liveValue : root.brightnessPercent)) + "%"
+                color: Qt.darker(root.bar.foreground, 1.4)
+                font.family: root.bar.fontFamily
+                font.pixelSize: Style.font.caption
+                font.bold: true
+                anchors.right: parent.right
+                anchors.rightMargin: Style.space(6)
+                anchors.verticalCenter: parent.verticalCenter
+              }
+            }
+
+            CursorSurface {
+              id: brightnessRow
+              width: parent.width
+              height: brightnessSlider.implicitHeight + Style.spacing.controlGap
+              hasCursor: root.cursorActive && root.focusSection === "brightness" && root.selectedIndex === -1
+              onHasCursorChanged: if (hasCursor) root.ensureCursorVisible(brightnessRow)
+              foreground: root.bar.foreground
+              outline: true
+
+              PanelSlider {
+                id: brightnessSlider
+                bar: root.bar
+                anchors.fill: parent
+                anchors.leftMargin: Style.space(6)
+                anchors.rightMargin: Style.space(6)
+                minimum: 1
+                maximum: 100
+                step: 1
+                value: root.brightnessPercent
+                integer: true
+                onMoved: function(v) { root.previewBrightness(v) }
+                onReleased: function(v) {
+                  brightnessDebounce.stop()
+                  root.setBrightness(v)
+                }
+              }
+
+              HoverHandler {
+                onHoveredChanged: if (hovered && !root.reflowingText) {
+                  root.cursorActive = true
+                  root.focusSection = "brightness"
+                  root.selectedIndex = -1
+                }
+              }
+            }
+          }
+
+          // ---------- Text size ----------
+          PanelSeparator {
+            visible: root.activeTab === "display"
+            foreground: root.bar.foreground
+          }
+
+          Column {
+            visible: root.activeTab === "display"
+            width: parent.width
+            spacing: Style.space(6)
+
+            Item {
+              width: parent.width
+              implicitHeight: Math.max(textSizeHeader.implicitHeight, textSizePx.implicitHeight)
+
+              PanelSectionHeader {
+                id: textSizeHeader
+                text: Commons.I18n.t("monitor.textSize")
+                foreground: root.bar.foreground
+                fontFamily: root.bar.fontFamily
+                anchors.left: parent.left
+                anchors.verticalCenter: parent.verticalCenter
+              }
+
+              Text {
+                id: textSizePx
+                textFormat: Text.PlainText
+                text: Commons.I18n.formatNumber(textSizeSlider.dragging
+                       ? root.textSizeStops[Math.round(textSizeSlider.liveValue)]
+                       : root.displayedTextPx()) + "px"
+                color: Qt.darker(root.bar.foreground, 1.4)
+                font.family: root.bar.fontFamily
+                font.pixelSize: Style.font.caption
+                font.bold: true
+                anchors.right: parent.right
+                anchors.rightMargin: Style.space(6)
+                anchors.verticalCenter: parent.verticalCenter
+              }
+            }
+
+            CursorSurface {
+              id: textSizeRow
+              width: parent.width
+              height: textSizeSlider.implicitHeight + Style.spacing.controlGap
+              hasCursor: root.cursorActive && root.focusSection === "textsize" && root.selectedIndex === -1
+              onHasCursorChanged: if (hasCursor) root.ensureCursorVisible(textSizeRow)
+              foreground: root.bar.foreground
+              outline: true
+
+              PanelSlider {
+                id: textSizeSlider
+                bar: root.bar
+                anchors.fill: parent
+                anchors.leftMargin: Style.space(6)
+                anchors.rightMargin: Style.space(6)
+                minimum: 0
+                maximum: root.textSizeStops.length - 1
+                step: 1
+                integer: true
+                tickCount: root.textSizeStops.length
+                value: root.currentTextIndex()
+                onReleased: function(v) { root.setTextSize(root.textSizeStops[Math.round(v)]) }
+              }
+
+              HoverHandler {
+                onHoveredChanged: if (hovered && !root.reflowingText) {
+                  root.cursorActive = true
+                  root.focusSection = "textsize"
+                  root.selectedIndex = -1
+                }
+              }
+            }
+          }
+
+          // ---------- Scale ----------
+          PanelSeparator {
+            visible: root.activeTab === "display"
+            foreground: root.bar.foreground
+          }
+
+          Column {
+            visible: root.activeTab === "display"
+            width: parent.width
+            spacing: Style.space(10)
+
+            Item {
+              width: parent.width
+              implicitHeight: Math.max(scaleHeader.implicitHeight, scaleMonitor.implicitHeight)
+
+              PanelSectionHeader {
+                id: scaleHeader
+                text: Commons.I18n.t("monitor.scale")
+                foreground: root.bar.foreground
+                fontFamily: root.bar.fontFamily
+                anchors.left: parent.left
+                anchors.verticalCenter: parent.verticalCenter
+              }
+
+              // Name the monitor SCALE targets, since it only applies to the
+              // focused one.
+              Text {
+                id: scaleMonitor
+                textFormat: Text.PlainText
+                text: root.focusedMonitor
+                // Only worth naming when more than one display is in play.
+                visible: root.focusedMonitor !== "" && root.enabledDisplayCount > 1
+                color: Qt.darker(root.bar.foreground, 1.4)
+                font.family: root.bar.fontFamily
+                font.pixelSize: Style.font.caption
+                font.bold: true
+                anchors.right: parent.right
+                anchors.rightMargin: Style.space(6)
+                anchors.verticalCenter: parent.verticalCenter
+              }
+            }
+
+            Grid {
+              id: scaleRow
+              width: parent.width
+              columns: root.scaleValues.length
+              spacing: Style.spacing.xs
+
+              readonly property real cellWidth: root.scaleValues.length > 0
+                ? (width - spacing * (columns - 1)) / columns
+                : 0
+
+              Repeater {
+                model: root.scaleValues
+
+                ScalePill {
+                  required property string modelData
+                  required property int index
+
+                  scaleValue: modelData
+                  scaleIndex: index
+                  width: scaleRow.cellWidth
+                }
+              }
+            }
+          }
+
+          // ---------- Monitors ----------
+          PanelSeparator {
+            visible: root.activeTab === "display" && root.displays.length > 1
+            foreground: root.bar.foreground
+          }
+
+          Column {
+            width: parent.width
+            spacing: Style.space(10)
+            visible: root.activeTab === "display" && root.displays.length > 1
+
+            PanelSectionHeader {
+              text: Commons.I18n.t("monitor.displays")
+              foreground: root.bar.foreground
+              fontFamily: root.bar.fontFamily
+            }
+
+            Repeater {
+              model: root.displays
+
+              MonitorRow {
+                required property var modelData
+                required property int index
+
+                width: panelColumn.width
+                display: modelData
+                rowIndex: index
+              }
+            }
+          }
+
+          // ---------- Layout ----------
+          Column {
+            width: parent.width
+            spacing: Style.space(12)
+            visible: root.activeTab === "layout"
+
+            Item {
+              width: parent.width
+              implicitHeight: Math.max(layoutHeader.implicitHeight, layoutHint.implicitHeight)
+
+              PanelSectionHeader {
+                id: layoutHeader
+                text: strings.t("layout.arrange")
+                foreground: root.bar.foreground
+                fontFamily: root.bar.fontFamily
+                anchors.left: parent.left
+                anchors.verticalCenter: parent.verticalCenter
+              }
+
+              Text {
+                id: layoutHint
+                textFormat: Text.PlainText
+                text: strings.t("layout.dragHint")
+                color: Qt.darker(root.bar.foreground, 1.4)
+                font.family: root.bar.fontFamily
+                font.pixelSize: Style.font.caption
+                font.bold: true
+                anchors.right: parent.right
+                anchors.rightMargin: Style.space(6)
+                anchors.verticalCenter: parent.verticalCenter
+              }
+            }
+
+            Item {
+              id: arrangementCanvas
+              width: parent.width
+              height: Style.space(190)
+              clip: true
+
+              onWidthChanged: {
+                root.canvasViewWidth = width
+                root.recomputeCanvas()
+              }
+              onHeightChanged: {
+                root.canvasViewHeight = height
+                root.recomputeCanvas()
+              }
+
+              BorderSurface {
+                anchors.fill: parent
+                color: Style.normalFillFor(root.bar.foreground, Commons.Color.accent)
+                borderSpec: Border.controlSpec("normal", root.bar.foreground, Commons.Color.accent)
+                radius: Style.cornerRadius
+              }
+
+              Repeater {
+                model: root.layoutNames
+
+                delegate: CursorSurface {
+                  id: monitorCard
+                  required property string modelData
+                  readonly property var monitor: root.layoutState[modelData] || ({})
+                  readonly property bool invalid: root.hasLayoutOverlap
+                    && Model.monitorOverlaps(root.layoutMonitors, modelData)
+
+                  visible: monitor.enabled === true
+                  x: root.canvasOffsetX + (monitor.x || 0) * root.canvasScale
+                  y: root.canvasOffsetY + (monitor.y || 0) * root.canvasScale
+                  width: Math.max(Style.space(36), (monitor.layoutWidth || 1) * root.canvasScale)
+                  height: Math.max(Style.space(26), (monitor.layoutHeight || 1) * root.canvasScale)
+                  hasCursor: root.selectedLayoutName === modelData
+                  bordered: true
+                  foreground: root.bar.foreground
+                  accent: invalid ? Commons.Color.urgent : Commons.Color.accent
+                  fill: Style.hoverFillFor(root.bar.foreground, Commons.Color.accent)
+                  currentFill: Style.selectedFillFor(root.bar.foreground, Commons.Color.accent)
+                  radius: Style.cornerRadius
+
+                  Column {
+                    anchors.centerIn: parent
+                    width: Math.max(1, parent.width - Style.space(8))
+                    spacing: 1
+
+                    Text {
+                      textFormat: Text.PlainText
+                      text: monitorCard.monitor.name || ""
+                      color: monitorCard.hasCursor
+                        ? Commons.Color.accent
+                        : root.bar.foreground
+                      font.family: root.bar.fontFamily
+                      font.pixelSize: Style.font.caption
+                      font.bold: true
+                      elide: Text.ElideRight
+                      horizontalAlignment: Text.AlignHCenter
+                      width: parent.width
+                    }
+
+                    Text {
+                      textFormat: Text.PlainText
+                      visible: monitorCard.height > Style.space(48)
+                      text: (monitorCard.monitor.pendingResolution || "")
+                        + " · " + (monitorCard.monitor.pendingRefresh || "") + " Hz"
+                      color: Qt.darker(root.bar.foreground, 1.3)
+                      font.family: root.bar.fontFamily
+                      font.pixelSize: Style.font.caption
+                      elide: Text.ElideRight
+                      horizontalAlignment: Text.AlignHCenter
+                      width: parent.width
+                    }
+                  }
+
+                  Text {
+                    textFormat: Text.PlainText
+                    visible: monitorCard.monitor.x === 0 && monitorCard.monitor.y === 0
+                    text: "★"
+                    color: Commons.Color.accent
+                    font.family: root.bar.fontFamily
+                    font.pixelSize: Style.font.caption
+                    anchors.top: parent.top
+                    anchors.left: parent.left
+                    anchors.margins: Style.space(3)
+                  }
+
+                  MouseArea {
+                    anchors.fill: parent
+                    hoverEnabled: true
+                    preventStealing: true
+                    cursorShape: Qt.PointingHandCursor
+
+                    onPressed: function(mouse) {
+                      root.selectLayoutMonitor(monitorCard.modelData)
+                      root.dragMonitorName = monitorCard.modelData
+                      root.dragPressScene = monitorCard.mapToItem(null, mouse.x, mouse.y)
+                      root.dragStartX = monitorCard.monitor.x || 0
+                      root.dragStartY = monitorCard.monitor.y || 0
+                    }
+
+                    onPositionChanged: function(mouse) {
+                      if (!pressed || root.dragMonitorName !== monitorCard.modelData) return
+                      var point = monitorCard.mapToItem(null, mouse.x, mouse.y)
+                      var dx = (point.x - root.dragPressScene.x) / root.canvasScale
+                      var dy = (point.y - root.dragPressScene.y) / root.canvasScale
+                      var snapped = root.snappedPosition(
+                        monitorCard.modelData, root.dragStartX + dx, root.dragStartY + dy)
+                      root.moveMonitor(monitorCard.modelData, snapped.x, snapped.y)
+                    }
+
+                    onReleased: {
+                      if (root.dragMonitorName === monitorCard.modelData)
+                        root.dragMonitorName = ""
+                    }
+                  }
+                }
+              }
+
+              Text {
+                textFormat: Text.PlainText
+                visible: root.enabledLayoutMonitors.length === 0
+                text: strings.t("layout.noDisplays")
+                color: Qt.darker(root.bar.foreground, 1.3)
+                font.family: root.bar.fontFamily
+                font.pixelSize: Style.font.body
+                anchors.centerIn: parent
+              }
+            }
+
+            Flow {
+              width: parent.width
+              spacing: Style.spacing.xs
+
+              Repeater {
+                model: root.layoutNames
+
+                delegate: Button {
+                  required property string modelData
+                  readonly property var monitor: root.layoutState[modelData] || ({})
+
+                  text: monitor.name || modelData
+                  fontSize: Style.font.caption
+                  foreground: root.bar.foreground
+                  fontFamily: root.bar.fontFamily
+                  horizontalPadding: Style.spacing.sm
+                  verticalPadding: Style.spacing.controlPaddingY
+                  bordered: true
+                  selected: root.selectedLayoutName === modelData
+                  opacity: monitor.enabled === true ? 1 : 0.55
+                  onClicked: root.selectLayoutMonitor(modelData)
+                }
+              }
+            }
+
+            Row {
+              width: parent.width
+              spacing: Style.spacing.xs
+
+              Button {
+                width: (parent.width - parent.spacing * 2) / 3
+                text: strings.t("layout.arrangeButton")
+                fontSize: Style.font.caption
+                foreground: root.bar.foreground
+                fontFamily: root.bar.fontFamily
+                horizontalPadding: Style.spacing.xs
+                verticalPadding: Style.spacing.controlPaddingY
+                bordered: true
+                enabled: root.enabledLayoutMonitors.length > 1
+                onClicked: root.arrangeMonitors(false)
+              }
+
+              Button {
+                width: (parent.width - parent.spacing * 2) / 3
+                text: strings.t("layout.swap")
+                fontSize: Style.font.caption
+                foreground: root.bar.foreground
+                fontFamily: root.bar.fontFamily
+                horizontalPadding: Style.spacing.xs
+                verticalPadding: Style.spacing.controlPaddingY
+                bordered: true
+                enabled: root.enabledLayoutMonitors.length > 1
+                onClicked: root.arrangeMonitors(true)
+              }
+
+              Button {
+                width: (parent.width - parent.spacing * 2) / 3
+                text: strings.t("layout.primary")
+                fontSize: Style.font.caption
+                foreground: root.bar.foreground
+                fontFamily: root.bar.fontFamily
+                horizontalPadding: Style.spacing.xs
+                verticalPadding: Style.spacing.controlPaddingY
+                bordered: true
+                enabled: root.selectedMonitor !== null
+                  && root.selectedMonitor.enabled
+                  && !(root.selectedMonitor.x === 0 && root.selectedMonitor.y === 0)
+                onClicked: if (root.selectedMonitor) root.makePrimary(root.selectedMonitor.name)
+              }
+            }
+
+            PanelSeparator {
+              foreground: root.bar.foreground
+            }
+
+            Column {
+              width: parent.width
+              spacing: Style.space(10)
+              visible: root.selectedMonitor !== null
+
+              Item {
+                width: parent.width
+                implicitHeight: Math.max(selectedName.implicitHeight, selectedEnabledToggle.implicitHeight)
+
+                Column {
+                  id: selectedName
+                  anchors.left: parent.left
+                  anchors.right: selectedEnabledLabel.left
+                  anchors.rightMargin: Style.space(10)
+                  anchors.verticalCenter: parent.verticalCenter
+                  spacing: 1
+
+                  Text {
+                    textFormat: Text.PlainText
+                    text: root.selectedMonitor ? root.selectedMonitor.name : ""
+                    color: root.bar.foreground
+                    font.family: root.bar.fontFamily
+                    font.pixelSize: Style.font.subtitle
+                    font.bold: true
+                    elide: Text.ElideRight
+                    width: parent.width
+                  }
+
+                  Text {
+                    textFormat: Text.PlainText
+                    text: root.selectedMonitor
+                      ? (root.selectedMonitor.description || "")
+                        + " · " + (root.selectedMonitor.pendingResolution || "")
+                        + " · " + Commons.I18n.formatNumber(root.selectedMonitor.scale) + "x"
+                      : ""
+                    color: Qt.darker(root.bar.foreground, 1.4)
+                    font.family: root.bar.fontFamily
+                    font.pixelSize: Style.font.caption
+                    elide: Text.ElideRight
+                    width: parent.width
+                  }
+                }
+
+                Text {
+                  id: selectedEnabledLabel
+                  anchors.right: selectedEnabledToggle.left
+                  anchors.rightMargin: Style.space(8)
+                  anchors.verticalCenter: parent.verticalCenter
+                  textFormat: Text.PlainText
+                  text: root.selectedMonitor && root.selectedMonitor.enabled
+                    ? strings.t("layout.on")
+                    : strings.t("layout.off")
+                  color: Qt.darker(root.bar.foreground, 1.35)
+                  font.family: root.bar.fontFamily
+                  font.pixelSize: Style.font.caption
+                  font.bold: true
+                }
+
+                ToggleSwitch {
+                  id: selectedEnabledToggle
+                  anchors.right: parent.right
+                  anchors.verticalCenter: parent.verticalCenter
+                  checked: root.selectedMonitor ? root.selectedMonitor.enabled : false
+                  foreground: root.bar.foreground
+                  accent: Commons.Color.accent
+                  onToggled: if (root.selectedMonitor)
+                    root.setMonitorEnabled(root.selectedMonitor.name, !root.selectedMonitor.enabled)
+                }
+              }
+
+              Dropdown {
+                width: parent.width
+                label: strings.t("layout.resolution")
+                value: root.selectedMonitor ? root.selectedMonitor.pendingResolution : ""
+                options: root.resolutionDropdownOptions
+                foreground: root.bar.foreground
+                fontFamily: root.bar.fontFamily
+                enabled: root.selectedMonitor ? root.selectedMonitor.enabled : false
+                onChanged: function(value) {
+                  if (root.selectedMonitor)
+                    root.setMonitorResolution(root.selectedMonitor.name, value)
+                }
+              }
+
+              Dropdown {
+                width: parent.width
+                label: strings.t("layout.refresh")
+                value: root.selectedMonitor ? root.selectedMonitor.pendingRefresh : ""
+                options: root.refreshDropdownOptions
+                foreground: root.bar.foreground
+                fontFamily: root.bar.fontFamily
+                enabled: root.selectedMonitor
+                  ? (root.selectedMonitor.enabled && root.refreshDropdownOptions.length > 0)
+                  : false
+                onChanged: function(value) {
+                  if (root.selectedMonitor)
+                    root.setMonitorRefresh(root.selectedMonitor.name, value)
+                }
+              }
+
+              Text {
+                textFormat: Text.PlainText
+                visible: root.hasLayoutOverlap
+                text: root.overlapNames !== ""
+                  ? strings.t("layout.overlapNamed").arg(root.overlapNames)
+                  : strings.t("layout.overlap")
+                color: Commons.Color.urgent
+                font.family: root.bar.fontFamily
+                font.pixelSize: Style.font.caption
+                font.bold: true
+                wrapMode: Text.Wrap
+                width: parent.width
+              }
+
+              Text {
+                textFormat: Text.PlainText
+                visible: root.layoutStatusKey !== "" || root.layoutStatusDetail !== ""
+                text: {
+                  var base = root.layoutStatusKey !== "" ? strings.t(root.layoutStatusKey) : ""
+                  return root.layoutStatusDetail !== ""
+                    ? (base !== "" ? base + ": " + root.layoutStatusDetail : root.layoutStatusDetail)
+                    : base
+                }
+                color: root.layoutStatusKey === "layout.failed"
+                  ? Commons.Color.urgent
+                  : Qt.darker(root.bar.foreground, 1.35)
+                font.family: root.bar.fontFamily
+                font.pixelSize: Style.font.caption
+                wrapMode: Text.Wrap
+                width: parent.width
+              }
+
+              Row {
+                width: parent.width
+                spacing: Style.spacing.xs
+
+                Button {
+                  width: (parent.width - parent.spacing) / 2
+                  text: strings.t("layout.apply")
+                  fontSize: Style.font.body
+                  foreground: root.bar.foreground
+                  fontFamily: root.bar.fontFamily
+                  horizontalPadding: Style.spacing.sm
+                  verticalPadding: Style.spacing.controlPaddingY
+                  bordered: true
+                  selected: root.layoutDirty && !root.hasLayoutOverlap && !root.applyRunning
+                  enabled: root.layoutDirty && !root.hasLayoutOverlap && !root.applyRunning
+                  onClicked: root.applyLayout()
+                }
+
+                Button {
+                  width: (parent.width - parent.spacing) / 2
+                  text: root.layoutDirty
+                    ? strings.t("layout.revert")
+                    : strings.t("layout.reload")
+                  fontSize: Style.font.body
+                  foreground: root.bar.foreground
+                  fontFamily: root.bar.fontFamily
+                  horizontalPadding: Style.spacing.sm
+                  verticalPadding: Style.spacing.controlPaddingY
+                  bordered: true
+                  enabled: !root.applyRunning
+                  onClicked: root.revertLayout()
+                }
+              }
+
+              Text {
+                textFormat: Text.PlainText
+                text: strings.t("layout.rememberHint")
+                color: Qt.darker(root.bar.foreground, 1.5)
+                font.family: root.bar.fontFamily
+                font.pixelSize: Style.font.caption
+                wrapMode: Text.Wrap
+                width: parent.width
+              }
+            }
+          }
+
+          Item {
+            width: parent.width
+            height: Style.space(4)
+          }
+        }
+      }
+    }
+  }
+
+  component ScalePill: Button {
+    id: pill
+    required property string scaleValue
+    required property int scaleIndex
+
+    text: Commons.I18n.formatNumber(root.effectiveScale(scaleValue)) + "x"
+    fontSize: Style.font.caption
+    foreground: root.bar.foreground
+    fontFamily: root.bar.fontFamily
+    horizontalPadding: Style.spacing.sm
+    verticalPadding: Style.spacing.controlPaddingY
+    bordered: true
+
+    active: root.activeScaleIndex() === scaleIndex
+    hasCursor: root.cursorActive && root.focusSection === "scale" && root.selectedIndex === scaleIndex
+
+    onClicked: root.setScale(scaleValue)
+    onHovered: function(isHovered) {
+      if (!isHovered || root.reflowingText) return
+      root.cursorActive = true
+      root.focusSection = "scale"
+      root.selectedIndex = pill.scaleIndex
+    }
+  }
+
+  component MonitorRow: CursorSurface {
+    id: monitorRow
+    required property var display
+    required property int rowIndex
+
+    readonly property bool isFocused: display && display.focused
+    readonly property bool canToggle: display && (!display.enabled || root.enabledDisplayCount > 1)
+
+    hasCursor: root.cursorActive && root.focusSection === "monitors" && root.selectedIndex === rowIndex
+    onHasCursorChanged: if (hasCursor) root.ensureCursorVisible(monitorRow)
+    current: isFocused
+    foreground: root.bar.foreground
+    fill: Style.hoverFillFor(root.bar.foreground, Commons.Color.accent)
+    currentFill: Style.selectedFillFor(root.bar.foreground, Commons.Color.accent)
+    implicitHeight: monitorInner.implicitHeight + Style.spacing.xl
+    opacity: canToggle ? 1.0 : 0.45
+
+    Row {
+      id: monitorInner
+      anchors.left: parent.left
+      anchors.right: parent.right
+      anchors.verticalCenter: parent.verticalCenter
+      anchors.leftMargin: Style.space(6)
+      anchors.rightMargin: Style.space(6)
+      spacing: Style.space(8)
+
+      Text {
+        text: "󰍹"
+        color: root.bar.foreground
+        font.family: root.bar.fontFamily
+        font.pixelSize: Style.font.title
+        width: Style.space(22)
+        horizontalAlignment: Text.AlignHCenter
+        anchors.verticalCenter: parent.verticalCenter
+      }
+
+      Text {
+        textFormat: Text.PlainText
+        text: monitorRow.display.focused
+          ? Commons.I18n.t("monitor.displayFocused").arg(monitorRow.display.name)
+          : monitorRow.display.name
+        color: root.bar.foreground
+        font.family: root.bar.fontFamily
+        font.pixelSize: Style.font.body
+        elide: Text.ElideRight
+        width: parent.width - Style.space(22) - Style.space(14) - Style.space(16)
+        anchors.verticalCenter: parent.verticalCenter
+      }
+
+      Text {
+        textFormat: Text.PlainText
+        text: monitorRow.display.enabled ? "󰄬" : ""
+        color: root.bar.foreground
+        font.family: root.bar.fontFamily
+        font.pixelSize: Style.font.subtitle
+        width: Style.space(14)
+        horizontalAlignment: Text.AlignRight
+        anchors.verticalCenter: parent.verticalCenter
+      }
+    }
+
+    MouseArea {
+      anchors.fill: parent
+      hoverEnabled: true
+      cursorShape: monitorRow.canToggle ? Qt.PointingHandCursor : Qt.ArrowCursor
+      onContainsMouseChanged: if (containsMouse && !root.reflowingText) {
+        root.cursorActive = true
+        root.focusSection = "monitors"
+        root.selectedIndex = monitorRow.rowIndex
+      }
+      onClicked: if (monitorRow.canToggle) root.toggleDisplay(monitorRow.display.name, monitorRow.display.enabled)
+    }
+  }
+}
