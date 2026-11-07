@@ -59,4 +59,13 @@ grep -q '^monitor=desc:Monitor A' "$HOME/.config/hypr/monitors.conf"
 grep -q '^monitor=desc:Monitor B' "$HOME/.config/hypr/monitors.conf"
 test -s "$HOME/.config/omarchy/monitor-presets.json"
 
+# Confirming a trial (--commit) writes config and preset but makes no live calls.
+printf 'monitor=KEEP_ME\n' > "$HOME/.config/hypr/monitors.conf"
+rm -f "$HOME/.config/omarchy/monitor-presets.json"
+: > "$EVAL_LOG"
+bash "$script_dir/../apply-displays.sh" "$payload" --commit >/dev/null
+test ! -s "$EVAL_LOG"
+grep -q '^monitor=desc:Monitor A' "$HOME/.config/hypr/monitors.conf"
+test -s "$HOME/.config/omarchy/monitor-presets.json"
+
 echo "apply-displays tests passed"

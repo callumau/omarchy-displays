@@ -17,8 +17,10 @@ for safe swaps.
   right. The star marks the display at the origin.
 - **Resolution** and **refresh rate** per display, read from Hyprland's
   available modes.
-- **Apply** writes the layout, applies it live, and saves it as a preset for
-  the exact set of connected displays.
+- **Apply** tests the layout live. A 15-second **Keep this layout?** prompt
+  follows; if you do not confirm, the previous layout is restored
+  automatically. Confirming writes the config and saves a preset for the exact
+  set of connected displays.
 - **Reload/Revert** re-reads the live layout or discards unsaved edits.
 - **Automatic restore**: plugging a monitor back in restores the best matching
   saved layout without opening the panel.
@@ -66,7 +68,9 @@ The original brightness, text size, scale, and enable/disable controls remain.
 - **Swap** reverses that order.
 - **Primary** puts the selected display at `0,0`.
 - Pick a **resolution** and **refresh rate** for the selected display.
-- **Apply** writes the layout and remembers it.
+- **Apply** tries the layout live. Confirm with **Keep** within 15 seconds, or
+  it automatically restores the previous layout. Only **Keep** writes
+  `monitors.conf` and saves the preset.
 
 > Hyprland has no separate "primary output" flag. Primary here means the
 > display placed at the origin, `0,0`, which is how most apps and games pick
@@ -74,7 +78,7 @@ The original brightness, text size, scale, and enable/disable controls remain.
 
 ## Presets
 
-Every **Apply** saves the layout in:
+Pressing **Keep** after an Apply saves the layout in:
 
 ```
 ~/.config/omarchy/monitor-presets.json
@@ -88,10 +92,9 @@ in or removed it picks the saved preset with the largest match and restores it.
 Monitors the preset has never seen are packed to the right of the saved
 arrangement, so a saved `A+B` layout still works when a third display appears.
 
-Automatic restores apply the saved layout live but do **not** rewrite
-`monitors.conf`; only an explicit **Apply** writes configuration. Saving a
-preset is the consent for that layout to be restored when the same monitor set
-is connected again.
+Neither a trial Apply nor an automatic restore rewrites `monitors.conf`; only
+an explicit **Keep** writes configuration. Saving a preset is the consent for
+that layout to be restored when the same monitor set is connected again.
 
 The file is plain JSON, capped at 32 entries (oldest dropped). Delete an entry
 to forget that layout.

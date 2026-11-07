@@ -19,7 +19,17 @@
   "layout.revert": "Revert",
   "layout.reload": "Reload",
   "layout.applying": "Applying…",
-  "layout.applied": "Layout applied and remembered for these displays",
+  "layout.applied": "Layout kept and remembered for these displays",
   "layout.failed": "Could not apply layout",
-  "layout.rememberHint": "Apply saves this arrangement for this exact set of displays. Plug them in again and it returns automatically."
+  "layout.confirmTitle": "Keep this layout?",
+  "layout.confirmBody": "Reverting to the previous layout in %1 seconds unless you keep it.",
+  "layout.keep": "Keep",
+  "layout.revertNow": "Revert now",
+  "layout.testing": "Testing layout — keep it or it will revert",
+  "layout.saving": "Saving layout…",
+  "layout.reverting": "Reverting…",
+  "layout.reverted": "Reverted to the previous layout",
+  "layout.saveFailed": "Applied, but could not save the layout",
+  "layout.revertFailed": "Could not revert the layout",
+  "layout.rememberHint": "Apply tests the layout live. Keep it within 15 seconds or it reverts. Keeping saves it for this exact set of displays."
 }

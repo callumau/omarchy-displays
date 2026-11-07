@@ -50,6 +50,17 @@ Panel {
   property string layoutStatusKey: ""
   property string layoutStatusDetail: ""
 
+  // Post-Apply trial: a layout is live but not persisted until the user keeps
+  // it. If the timer expires, the previous live layout comes back.
+  readonly property int confirmationSeconds: 15
+  property bool confirmPending: false
+  property int confirmSecondsLeft: confirmationSeconds
+  property real confirmDeadline: 0
+  property string applyMode: "apply"
+  property var pendingLayoutRules: []
+  property var previousLayoutRules: []
+  property var liveLayoutRules: []
+
   // Drag state shared by the monitor cards.
   property string dragMonitorName: ""
   property point dragPressScene: Qt.point(0, 0)
@@ -332,6 +343,9 @@ Panel {
       activeTab: root.activeTab,
       layoutDirty: root.layoutDirty,
       overlap: root.hasLayoutOverlap,
+      confirmPending: root.confirmPending,
+      confirmSecondsLeft: root.confirmSecondsLeft,
+      applyMode: root.applyMode,
       layout: root.layoutMonitors.map(function(monitor) {
         return {
           name: monitor.name,
@@ -373,7 +387,7 @@ Panel {
 
   function refresh() {
     if (!stateProc.running) stateProc.running = true
-    if (!layoutDirty && !layoutProc.running) layoutProc.running = true
+    if ((!layoutDirty || confirmPending) && !layoutProc.running) layoutProc.running = true
   }
 
   function refreshLayout() {
@@ -473,8 +487,58 @@ Panel {
     layoutState = next
   }
 
+  function rulesFromMonitors(monitors) {
+    var rules = []
+    for (var i = 0; i < monitors.length; i++) {
+      var monitor = monitors[i]
+      if (!monitor) continue
+      var identity = monitor.identity || monitor.description || monitor.name
+      if (!monitor.enabled) {
+        rules.push({
+          name: monitor.name,
+          identity: identity,
+          description: monitor.description || "",
+          disabled: true
+        })
+      } else {
+        rules.push({
+          name: monitor.name,
+          identity: identity,
+          description: monitor.description || "",
+          mode: Model.modeString(monitor.pendingResolution, monitor.pendingRefresh),
+          position: Math.round(monitor.x) + "x" + Math.round(monitor.y),
+          scale: monitor.scale,
+          transform: monitor.transform,
+          disabled: false
+        })
+      }
+    }
+    return rules
+  }
+
+  function sameMonitorSet(monitors) {
+    if (!monitors || monitors.length !== layoutNames.length) return false
+    for (var i = 0; i < monitors.length; i++) {
+      if (layoutNames.indexOf(monitors[i].name) < 0) return false
+    }
+    return true
+  }
+
   function setLayoutMonitors(monitors) {
     if (!monitors || monitors.length === 0) return
+
+    var sameNames = sameMonitorSet(monitors)
+
+    // A hotplug during the confirmation prompt changes the display set under
+    // the pending trial. Drop the prompt and let the new snapshot (and the
+    // preset watcher) take over.
+    if (confirmPending) {
+      if (sameNames) return
+      confirmPending = false
+      confirmTimer.stop()
+      layoutStatusKey = ""
+      layoutStatusDetail = ""
+    }
 
     // Applying a swap briefly puts one display on top of another. Do not
     // replace a healthy, unsaved-free layout with that in-between snapshot;
@@ -500,16 +564,7 @@ Panel {
     if (names.indexOf(selectedLayoutName) < 0)
       selectedLayoutName = focusName !== "" ? focusName : names[0]
 
-    var sameNames = names.length === layoutNames.length
-    if (sameNames) {
-      for (var j = 0; j < names.length; j++) {
-        if (names[j] !== layoutNames[j]) {
-          sameNames = false
-          break
-        }
-      }
-    }
-
+    liveLayoutRules = rulesFromMonitors(monitors)
     layoutState = next
     if (!sameNames) layoutNames = names
     layoutDirty = false
@@ -725,45 +780,89 @@ Panel {
   }
 
   function applyLayout() {
-    if (applyProc.running) return
+    if (applyProc.running || confirmPending) return
     if (hasLayoutOverlap) return
     if (enabledLayoutMonitors.length === 0) return
 
-    var rules = []
-    for (var i = 0; i < layoutNames.length; i++) {
-      var monitor = layoutState[layoutNames[i]]
-      if (!monitor) continue
-      if (!monitor.enabled) {
-        rules.push({
-          name: monitor.name,
-          identity: monitor.identity,
-          description: monitor.description,
-          disabled: true
-        })
-      } else {
-        rules.push({
-          name: monitor.name,
-          identity: monitor.identity,
-          description: monitor.description,
-          mode: Model.modeString(monitor.pendingResolution, monitor.pendingRefresh),
-          position: Math.round(monitor.x) + "x" + Math.round(monitor.y),
-          scale: monitor.scale,
-          transform: monitor.transform,
-          disabled: false
-        })
-      }
-    }
-
+    var rules = rulesFromMonitors(layoutMonitors)
     if (rules.length === 0 || pluginDir === "") {
       layoutStatusKey = "layout.failed"
       layoutStatusDetail = pluginDir === "" ? "plugin path unavailable" : ""
       return
     }
+    if (liveLayoutRules.length === 0) {
+      layoutStatusKey = "layout.failed"
+      layoutStatusDetail = "no previous layout to revert to"
+      return
+    }
 
+    pendingLayoutRules = rules
+    previousLayoutRules = liveLayoutRules.slice()
+    applyMode = "apply"
     layoutStatusKey = "layout.applying"
     layoutStatusDetail = ""
     applyRunning = true
-    applyProc.command = ["bash", pluginDir + "/apply-displays.sh", JSON.stringify(rules), "--remember"]
+
+    // Trial only: no monitors.conf or preset write until the user keeps it.
+    applyProc.command = ["bash", pluginDir + "/apply-displays.sh", JSON.stringify(rules), "--live-only"]
+    applyProc.running = true
+  }
+
+  function startConfirmation() {
+    confirmPending = true
+    confirmSecondsLeft = confirmationSeconds
+    confirmDeadline = Date.now() + confirmationSeconds * 1000
+    confirmTimer.restart()
+    layoutStatusKey = "layout.testing"
+    layoutStatusDetail = ""
+    layoutDirty = true
+    applyRunning = false
+    focusConfirmation()
+  }
+
+  function tickConfirmation() {
+    var millisecondsLeft = confirmDeadline - Date.now()
+    if (millisecondsLeft <= 0) {
+      confirmSecondsLeft = 0
+      revertPendingLayout()
+      return
+    }
+    confirmSecondsLeft = Math.ceil(millisecondsLeft / 1000)
+  }
+
+  function focusConfirmation() {
+    if (!confirmPending) return
+    Qt.callLater(function() {
+      if (root.confirmPending && keepButton) keepButton.forceActiveFocus()
+    })
+  }
+
+  function keepPendingLayout() {
+    if (!confirmPending || applyProc.running) return
+    confirmTimer.stop()
+    confirmPending = false
+    applyMode = "keep"
+    layoutStatusKey = "layout.saving"
+    layoutStatusDetail = ""
+    applyRunning = true
+
+    // The live layout is already correct; write config and preset now.
+    applyProc.command = ["bash", pluginDir + "/apply-displays.sh", JSON.stringify(pendingLayoutRules), "--commit"]
+    applyProc.running = true
+  }
+
+  function revertPendingLayout() {
+    if (!confirmPending || applyProc.running) return
+    confirmTimer.stop()
+    confirmPending = false
+    applyMode = "revert"
+    layoutStatusKey = "layout.reverting"
+    layoutStatusDetail = ""
+    applyRunning = true
+
+    // config and preset still describe the previous layout, so a live apply
+    // is enough to bring it back.
+    applyProc.command = ["bash", pluginDir + "/apply-displays.sh", JSON.stringify(previousLayoutRules), "--live-only"]
     applyProc.running = true
   }
 
@@ -828,9 +927,11 @@ Panel {
         selectedIndex = 0
       }
       cursorActive = false
+      if (confirmPending) focusConfirmation()
     }
   }
 
+  onConfirmPendingChanged: if (confirmPending) focusConfirmation()
   onBrightnessAvailableChanged: clampCursor()
   onDisplaysChanged: clampCursor()
   onScaleValuesChanged: clampCursor()
@@ -857,6 +958,14 @@ Panel {
     onTriggered: root.refreshLayout()
   }
 
+  Timer {
+    id: confirmTimer
+    interval: 250
+    repeat: true
+    running: root.confirmPending
+    onTriggered: root.tickConfirmation()
+  }
+
   Process {
     id: layoutProc
     command: ["hyprctl", "-j", "monitors", "all"]
@@ -872,14 +981,43 @@ Panel {
     stderr: StdioCollector { id: applyStderr; waitForEnd: true }
     onExited: function(exitCode) {
       root.applyRunning = false
+      var error = String(applyStderr.text || "").trim().slice(0, 160)
+
       if (exitCode === 0) {
-        root.layoutStatusKey = "layout.applied"
-        root.layoutStatusDetail = ""
+        if (root.applyMode === "apply") {
+          root.startConfirmation()
+          return
+        }
+        if (root.applyMode === "keep") {
+          root.layoutStatusKey = "layout.applied"
+          root.layoutStatusDetail = ""
+          root.layoutDirty = false
+          root.confirmPending = false
+          root.refresh()
+          return
+        }
+        if (root.applyMode === "revert") {
+          root.layoutStatusKey = "layout.reverted"
+          root.layoutStatusDetail = ""
+          root.layoutDirty = false
+          root.confirmPending = false
+          root.refresh()
+          return
+        }
+      }
+
+      if (root.applyMode === "keep") {
+        root.layoutStatusKey = "layout.saveFailed"
+        root.layoutStatusDetail = error
+        root.layoutDirty = true
+      } else if (root.applyMode === "revert") {
+        root.layoutStatusKey = "layout.revertFailed"
+        root.layoutStatusDetail = error
         root.layoutDirty = false
-        root.refresh()
       } else {
         root.layoutStatusKey = "layout.failed"
-        root.layoutStatusDetail = String(applyStderr.text || "").trim().slice(0, 160)
+        root.layoutStatusDetail = error
+        root.confirmPending = false
       }
     }
   }
@@ -997,6 +1135,9 @@ Panel {
       property alias scrollArea: scrollArea
       implicitHeight: panelColumn.implicitHeight
       anchors.fill: parent
+      // The confirmation card owns the keyboard while it is up; its Keep
+      // button takes focus and Enter/Space confirms.
+      blocked: root.confirmPending
       onMoveRequested: function(dx, dy) {
         if (!root.cursorActive) { root.cursorActive = true; return }
         if (dy !== 0) root.moveCursor(dy)
@@ -1752,8 +1893,10 @@ Panel {
                   horizontalPadding: Style.spacing.sm
                   verticalPadding: Style.spacing.controlPaddingY
                   bordered: true
-                  selected: root.layoutDirty && !root.hasLayoutOverlap && !root.applyRunning
-                  enabled: root.layoutDirty && !root.hasLayoutOverlap && !root.applyRunning
+                  selected: root.layoutDirty && !root.hasLayoutOverlap
+                    && !root.applyRunning && !root.confirmPending
+                  enabled: root.layoutDirty && !root.hasLayoutOverlap
+                    && !root.applyRunning && !root.confirmPending
                   onClicked: root.applyLayout()
                 }
 
@@ -1768,7 +1911,7 @@ Panel {
                   horizontalPadding: Style.spacing.sm
                   verticalPadding: Style.spacing.controlPaddingY
                   bordered: true
-                  enabled: !root.applyRunning
+                  enabled: !root.applyRunning && !root.confirmPending
                   onClicked: root.revertLayout()
                 }
               }
@@ -1788,6 +1931,96 @@ Panel {
           Item {
             width: parent.width
             height: Style.space(4)
+          }
+        }
+      }
+
+      // Post-Apply trial card. It covers the panel so the layout behind it is
+      // visible around the edges but cannot be edited until Keep/Revert.
+      Item {
+        id: confirmOverlay
+        anchors.fill: parent
+        visible: root.confirmPending
+        z: 100
+        onVisibleChanged: if (visible) root.focusConfirmation()
+        Keys.onEscapePressed: root.revertPendingLayout()
+
+        Rectangle {
+          anchors.fill: parent
+          color: Qt.rgba(0, 0, 0, 0.55)
+        }
+
+        MouseArea {
+          anchors.fill: parent
+          onClicked: {}
+          onWheel: function(wheel) { wheel.accepted = true }
+        }
+
+        BorderSurface {
+          anchors.centerIn: parent
+          width: Math.min(parent.width - Style.space(32), Style.space(340))
+          implicitHeight: confirmColumn.implicitHeight + Style.space(24)
+          color: Commons.Color.popups.background
+          borderSpec: Border.controlSpec("focus", Commons.Color.popups.text, Commons.Color.accent)
+          radius: Style.cornerRadius
+
+          Column {
+            id: confirmColumn
+            anchors.fill: parent
+            anchors.margins: Style.space(12)
+            spacing: Style.space(10)
+
+            Text {
+              textFormat: Text.PlainText
+              text: strings.t("layout.confirmTitle")
+              color: Commons.Color.popups.text
+              font.family: root.bar.fontFamily
+              font.pixelSize: Style.font.title
+              font.bold: true
+              width: parent.width
+            }
+
+            Text {
+              textFormat: Text.PlainText
+              text: strings.t("layout.confirmBody")
+                .arg(Commons.I18n.formatNumber(root.confirmSecondsLeft))
+              color: Qt.darker(Commons.Color.popups.text, 1.3)
+              font.family: root.bar.fontFamily
+              font.pixelSize: Style.font.body
+              wrapMode: Text.Wrap
+              width: parent.width
+            }
+
+            Row {
+              width: parent.width
+              spacing: Style.spacing.xs
+
+              Button {
+                id: keepButton
+                width: (parent.width - parent.spacing) / 2
+                text: strings.t("layout.keep")
+                foreground: Commons.Color.popups.text
+                fontFamily: root.bar.fontFamily
+                horizontalPadding: Style.spacing.sm
+                verticalPadding: Style.spacing.controlPaddingY
+                bordered: true
+                selected: true
+                focusable: true
+                onClicked: root.keepPendingLayout()
+              }
+
+              Button {
+                width: (parent.width - parent.spacing) / 2
+                text: strings.t("layout.revertNow")
+                foreground: Commons.Color.popups.text
+                fontFamily: root.bar.fontFamily
+                horizontalPadding: Style.spacing.sm
+                verticalPadding: Style.spacing.controlPaddingY
+                bordered: true
+                focusable: true
+                onClicked: root.revertPendingLayout()
+              }
+            }
           }
         }
       }
