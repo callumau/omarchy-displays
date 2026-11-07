@@ -37,12 +37,10 @@ The plugin installs as `io.github.callumau.displays`. `omarchy plugin add`
 validates the manifest, copies the plugin into
 `~/.config/omarchy/plugins/io.github.callumau.displays`, and enables it.
 
-Manual install:
+Update it later with:
 
 ```bash
-git clone https://github.com/callumau/omarchy-displays.git \
-  ~/.config/omarchy/plugins/io.github.callumau.displays
-omarchy plugin enable io.github.callumau.displays --section right
+omarchy plugin update io.github.callumau.displays
 ```
 
 The plugin replaces the built-in `omarchy.monitor` widget while it is enabled.
