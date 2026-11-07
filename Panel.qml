@@ -32,6 +32,8 @@ Panel {
   Commons.Translations { id: strings; directory: Qt.resolvedUrl("i18n") }
 
   property string activeTab: "display"
+  // Latch: the Layout tab's UI builds on first activation and stays built.
+  property bool layoutBuilt: false
 
   // name -> monitor object. Replaced as a whole on every edit so the
   // Repeater delegates keep a stable model (their names array) while their
@@ -396,7 +398,9 @@ Panel {
   }
 
   function refresh() {
-    if (!stateProc.running) stateProc.running = true
+    // stateProc (brightness probe) costs ~0.8s; only run it for the Display
+    // tab that reads it. The Layout tab's layoutProc answers in ~15ms.
+    if (activeTab === "display" && !stateProc.running) stateProc.running = true
     if ((!layoutDirty || confirmPending) && !layoutProc.running) layoutProc.running = true
   }
 
@@ -1006,7 +1010,12 @@ Panel {
   onVisibleSectionsChanged: clampCursor()
   onActiveTabChanged: {
     clampCursor()
-    if (activeTab === "layout" && !layoutDirty) refreshLayout()
+    if (activeTab === "layout") {
+      layoutBuilt = true
+      if (!layoutDirty) refreshLayout()
+    } else if (activeTab === "display") {
+      refresh()
+    }
   }
 
   // Only poll while the panel is open; the bar glyph tracks monitor count via
@@ -1599,10 +1608,23 @@ Panel {
           }
 
           // ---------- Layout ----------
-          Column {
+          // Built lazily on first activation so opening the panel (usually
+          // the Display tab) stays at stock weight; the latch keeps it built
+          // afterwards so tab switches stay instant.
+          Loader {
             width: parent.width
-            spacing: Style.space(12)
             visible: root.activeTab === "layout"
+            active: root.layoutBuilt
+            sourceComponent: layoutTabComponent
+            implicitHeight: (root.activeTab === "layout" && item) ? item.implicitHeight : 0
+          }
+
+          Component {
+            id: layoutTabComponent
+
+            Column {
+              width: panelColumn.width
+              spacing: Style.space(12)
 
             Item {
               width: parent.width
@@ -2037,6 +2059,7 @@ Panel {
                 wrapMode: Text.Wrap
                 width: parent.width
               }
+            }
             }
           }
 
