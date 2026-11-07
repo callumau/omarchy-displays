@@ -88,6 +88,11 @@ in or removed it picks the saved preset with the largest match and restores it.
 Monitors the preset has never seen are packed to the right of the saved
 arrangement, so a saved `A+B` layout still works when a third display appears.
 
+Automatic restores apply the saved layout live but do **not** rewrite
+`monitors.conf`; only an explicit **Apply** writes configuration. Saving a
+preset is the consent for that layout to be restored when the same monitor set
+is connected again.
+
 The file is plain JSON, capped at 32 entries (oldest dropped). Delete an entry
 to forget that layout.
 
@@ -130,10 +135,11 @@ bash -n apply-displays.sh
 python3 -m py_compile apply-order.py
 node tests/model.test.js
 bash tests/apply-order.test.sh
+bash tests/apply-displays.test.sh
 ```
 
-`apply-order.py` has a self-contained test that uses a fake `hyprctl`, so it
-does not touch the running compositor.
+The shell and Python tests use a fake `hyprctl`, so they do not touch the
+running compositor.
 
 ## Uninstall
 
