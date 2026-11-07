@@ -68,4 +68,18 @@ test ! -s "$EVAL_LOG"
 grep -q '^monitor=desc:Monitor A' "$HOME/.config/hypr/monitors.conf"
 test -s "$HOME/.config/omarchy/monitor-presets.json"
 
+# Trial persistence survives a reload: save, re-read, then clear.
+trial='{"pending":[{"name":"A"}],"previous":[{"name":"A"}],"deadline":1893456000000,"monitors":["A"]}'
+bash "$script_dir/../apply-displays.sh" "$trial" --save-trial >/dev/null
+test -s "$HOME/.config/omarchy/.monitor-trial.json"
+grep -q '"deadline":1893456000000' "$HOME/.config/omarchy/.monitor-trial.json"
+bash "$script_dir/../apply-displays.sh" --clear-trial >/dev/null
+test ! -e "$HOME/.config/omarchy/.monitor-trial.json"
+
+# Bad trial payloads are refused.
+if bash "$script_dir/../apply-displays.sh" '{"pending":[]}' --save-trial >/dev/null 2>&1; then
+  echo "bad trial payload was accepted" >&2
+  exit 1
+fi
+
 echo "apply-displays tests passed"

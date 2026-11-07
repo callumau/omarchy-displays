@@ -73,6 +73,9 @@ Panel {
     return decodeURIComponent(url.substring(7)).replace(/\/+$/, "")
   }
 
+  readonly property string homeDir: Quickshell.env("HOME")
+  readonly property string trialPath: homeDir + "/.config/omarchy/.monitor-trial.json"
+
   readonly property var layoutMonitors: {
     var list = []
     for (var i = 0; i < layoutNames.length; i++) {
@@ -531,14 +534,19 @@ Panel {
 
     // A hotplug during the confirmation prompt changes the display set under
     // the pending trial. Drop the prompt and let the new snapshot (and the
-    // preset watcher) take over.
+    // preset watcher) take over. The first snapshot after a (re)load populates
+    // the canvas behind the resumed prompt instead.
     if (confirmPending) {
       if (sameNames) return
-      confirmPending = false
-      confirmTimer.stop()
-      layoutStatusKey = ""
-      layoutStatusDetail = ""
+      if (layoutNames.length > 0) {
+        confirmPending = false
+        confirmTimer.stop()
+        clearTrial()
+        layoutStatusKey = ""
+        layoutStatusDetail = ""
+      }
     }
+    var resumingTrial = confirmPending
 
     // Applying a swap briefly puts one display on top of another. Do not
     // replace a healthy, unsaved-free layout with that in-between snapshot;
@@ -567,10 +575,49 @@ Panel {
     liveLayoutRules = rulesFromMonitors(monitors)
     layoutState = next
     if (!sameNames) layoutNames = names
-    layoutDirty = false
-    layoutStatusKey = ""
-    layoutStatusDetail = ""
+    if (!resumingTrial) {
+      layoutDirty = false
+      layoutStatusKey = ""
+      layoutStatusDetail = ""
+    }
     recomputeCanvas()
+  }
+
+  function resumeTrial(raw) {
+    var trial = null
+    try {
+      trial = JSON.parse(String(raw || ""))
+    } catch (e) {
+      return
+    }
+    if (!trial || !Array.isArray(trial.pending) || !Array.isArray(trial.previous)) return
+    if (trial.pending.length === 0 || trial.previous.length === 0) return
+    var deadline = Number(trial.deadline)
+    if (!isFinite(deadline) || deadline <= 0) {
+      clearTrial()
+      return
+    }
+
+    pendingLayoutRules = trial.pending
+    previousLayoutRules = trial.previous
+
+    if (Date.now() >= deadline) {
+      // The deadline passed while the shell was gone: revert straight away.
+      confirmPending = true
+      revertPendingLayout()
+      return
+    }
+
+    confirmDeadline = deadline
+    confirmSecondsLeft = Math.max(1, Math.ceil((deadline - Date.now()) / 1000))
+    confirmPending = true
+    applyMode = "apply"
+    layoutStatusKey = "layout.testing"
+    layoutStatusDetail = ""
+    layoutDirty = true
+    activeTab = "layout"
+    open()
+    confirmTimer.restart()
   }
 
   function selectLayoutMonitor(name) {
@@ -808,6 +855,33 @@ Panel {
     applyProc.running = true
   }
 
+  function trialPayload() {
+    var names = []
+    for (var i = 0; i < layoutNames.length; i++) names.push(layoutNames[i])
+    return {
+      pending: pendingLayoutRules,
+      previous: previousLayoutRules,
+      deadline: confirmDeadline,
+      monitors: names
+    }
+  }
+
+  function saveTrial() {
+    if (pluginDir === "") return
+    if (trialSaveProc.running) return
+    trialSaveProc.command = ["bash", pluginDir + "/apply-displays.sh",
+      JSON.stringify(trialPayload()), "--save-trial"]
+    trialSaveProc.running = true
+  }
+
+  function clearTrial() {
+    if (pluginDir === "") return
+    if (trialClearProc.running) return
+    trialClearProc.command = ["bash", pluginDir + "/apply-displays.sh",
+      "--clear-trial"]
+    trialClearProc.running = true
+  }
+
   function startConfirmation() {
     confirmPending = true
     confirmSecondsLeft = confirmationSeconds
@@ -817,7 +891,11 @@ Panel {
     layoutStatusDetail = ""
     layoutDirty = true
     applyRunning = false
-    focusConfirmation()
+    saveTrial()
+    // Make sure the prompt is visible even if the panel was closed by the
+    // monitor move (the bar can rebuild its widgets when screens change).
+    activeTab = "layout"
+    open()
   }
 
   function tickConfirmation() {
@@ -830,17 +908,15 @@ Panel {
     confirmSecondsLeft = Math.ceil(millisecondsLeft / 1000)
   }
 
-  function focusConfirmation() {
-    if (!confirmPending) return
-    Qt.callLater(function() {
-      if (root.confirmPending && keepButton) keepButton.forceActiveFocus()
-    })
-  }
+  // The confirmation overlay focuses itself (see confirmOverlay): content ids
+  // inside KeyboardPanel's Component-wrapped content are not reachable from
+  // root functions, so the overlay owns its keyboard handling directly.
 
   function keepPendingLayout() {
     if (!confirmPending || applyProc.running) return
     confirmTimer.stop()
     confirmPending = false
+    clearTrial()
     applyMode = "keep"
     layoutStatusKey = "layout.saving"
     layoutStatusDetail = ""
@@ -911,7 +987,12 @@ Panel {
   implicitWidth: button.implicitWidth
   implicitHeight: button.implicitHeight
 
-  Component.onCompleted: refresh()
+  Component.onCompleted: {
+    refresh()
+    // blockLoading makes the trial text available on the first read, so a
+    // reload mid-confirmation resumes the prompt instead of stranding it.
+    resumeTrial(trialFile.text())
+  }
 
   // KeyboardPanel primes focus at open-time, so SUPER-bound IPC summons land
   // with j/k ready to navigate. Keep a default landing point, but don't paint
@@ -927,11 +1008,8 @@ Panel {
         selectedIndex = 0
       }
       cursorActive = false
-      if (confirmPending) focusConfirmation()
     }
   }
-
-  onConfirmPendingChanged: if (confirmPending) focusConfirmation()
   onBrightnessAvailableChanged: clampCursor()
   onDisplaysChanged: clampCursor()
   onScaleValuesChanged: clampCursor()
@@ -1001,6 +1079,7 @@ Panel {
           root.layoutStatusDetail = ""
           root.layoutDirty = false
           root.confirmPending = false
+          root.clearTrial()
           root.refresh()
           return
         }
@@ -1018,8 +1097,30 @@ Panel {
         root.layoutStatusKey = "layout.failed"
         root.layoutStatusDetail = error
         root.confirmPending = false
+        root.clearTrial()
       }
     }
+  }
+
+  // Trial persistence: a reload mid-confirmation must not strand the trial
+  // layout. The file is written on Apply and cleared on Keep, revert, or drop.
+  Process {
+    id: trialSaveProc
+    stdout: StdioCollector { waitForEnd: true }
+  }
+
+  Process {
+    id: trialClearProc
+    stdout: StdioCollector { waitForEnd: true }
+  }
+
+  FileView {
+    id: trialFile
+    path: root.trialPath
+    watchChanges: false
+    printErrors: false
+    blockLoading: true
+    onLoaded: root.resumeTrial(text())
   }
 
   Process {
@@ -1942,7 +2043,14 @@ Panel {
         anchors.fill: parent
         visible: root.confirmPending
         z: 100
-        onVisibleChanged: if (visible) root.focusConfirmation()
+        // Self-focus: content ids are not reachable from root functions, so
+        // the overlay takes focus itself and owns its keys. PanelKeyCatcher
+        // is blocked while the prompt is up, so these reach it directly.
+        focus: true
+        onVisibleChanged: if (visible) forceActiveFocus()
+        Keys.onReturnPressed: root.keepPendingLayout()
+        Keys.onEnterPressed: root.keepPendingLayout()
+        Keys.onSpacePressed: root.keepPendingLayout()
         Keys.onEscapePressed: root.revertPendingLayout()
 
         Rectangle {

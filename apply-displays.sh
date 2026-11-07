@@ -19,6 +19,11 @@
 # --commit writes monitors.conf and the preset without re-applying. The panel
 # uses it when the user presses Keep in the post-Apply confirmation prompt.
 # Only an explicit Keep (or a manual Apply with --remember) writes config.
+#
+# --save-trial '<trial-json>' records a pending confirmation so a shell or
+# plugin reload mid-trial cannot strand the trial layout: on startup the panel
+# resumes the countdown (or reverts immediately if the deadline passed).
+# --clear-trial removes that record.
 
 set -euo pipefail
 
@@ -29,6 +34,36 @@ fail() {
 
 payload="${1:-}"
 action="${2:-}"
+
+trial_file="$HOME/.config/omarchy/.monitor-trial.json"
+
+if [[ $action == "--save-trial" || $payload == "--save-trial" ]]; then
+  trial_json="$payload"
+  if [[ $payload == "--save-trial" ]]; then
+    trial_json="$action"
+    action="--save-trial"
+  fi
+  [[ -n ${trial_json:-} && $trial_json != "--save-trial" ]] || fail "missing trial payload"
+  jq -e '
+    (.pending | type == "array" and length >= 1 and length <= 32)
+    and (.previous | type == "array" and length >= 1 and length <= 32)
+    and (.deadline | type == "number" and . > 0)
+    and (.monitors | type == "array" and length >= 1)
+  ' >/dev/null 2>&1 <<<"$trial_json" || fail "invalid trial payload"
+  mkdir -p "$(dirname "$trial_file")"
+  tmp_trial=$(mktemp "$(dirname "$trial_file")/.monitor-trial.XXXXXX")
+  trap 'rm -f "${tmp_trial:-}"' EXIT
+  jq -c '.version = 1' <<<"$trial_json" > "$tmp_trial"
+  mv "$tmp_trial" "$trial_file"
+  echo "ok trial saved"
+  exit 0
+fi
+
+if [[ $action == "--clear-trial" || $payload == "--clear-trial" ]]; then
+  rm -f "$trial_file"
+  echo "ok trial cleared"
+  exit 0
+fi
 
 [[ -n $payload ]] || fail "missing layout payload"
 case "$action" in

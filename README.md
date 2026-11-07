@@ -70,7 +70,10 @@ The original brightness, text size, scale, and enable/disable controls remain.
 - Pick a **resolution** and **refresh rate** for the selected display.
 - **Apply** tries the layout live. Confirm with **Keep** within 15 seconds, or
   it automatically restores the previous layout. Only **Keep** writes
-  `monitors.conf` and saves the preset.
+  `monitors.conf` and saves the preset. The pending confirmation is recorded
+  on disk, so even a shell restart mid-trial brings the prompt back (or
+  reverts immediately if the countdown already expired) instead of stranding
+  the trial layout.
 
 > Hyprland has no separate "primary output" flag. Primary here means the
 > display placed at the origin, `0,0`, which is how most apps and games pick
