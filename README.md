@@ -153,7 +153,11 @@ running compositor.
 omarchy plugin remove io.github.callumau.displays
 ```
 
-This restores the built-in `omarchy.monitor` widget.
+This restores the built-in `omarchy.monitor` widget. Removal deletes only the
+plugin folder; your own configuration files are left untouched on purpose:
+`~/.config/hypr/monitors.conf` (plus its `.bak`), and
+`~/.config/omarchy/monitor-presets.json`. Delete those manually if you want a
+fully stock setup again.
 
 ## License
 
