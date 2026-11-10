@@ -1616,7 +1616,6 @@ Panel {
             visible: root.activeTab === "layout"
             active: root.layoutBuilt
             sourceComponent: layoutTabComponent
-            implicitHeight: (root.activeTab === "layout" && item) ? item.implicitHeight : 0
           }
 
           Component {
