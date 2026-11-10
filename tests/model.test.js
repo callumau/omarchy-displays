@@ -163,4 +163,67 @@ b.x = 3000
 assert.equal(Model.overlaps(a, b), false)
 assert.equal(Model.freePosition([a, b], "other").x, 5560)
 
+// hyprctl reports the mode's pixel size, so a 90 degree rotation swaps the
+// footprint: a portrait panel beside a landscape one is adjacent, not
+// overlapping.
+const rotated = Model.parseMonitors(JSON.stringify([
+  {
+    name: "DP-1",
+    description: "Portrait",
+    width: 2560,
+    height: 1440,
+    x: 0,
+    y: 0,
+    scale: 1,
+    refreshRate: 60,
+    transform: 1
+  },
+  {
+    name: "DP-2",
+    description: "Landscape",
+    width: 2560,
+    height: 1440,
+    x: 1440,
+    y: 0,
+    scale: 1,
+    refreshRate: 60,
+    transform: 0
+  }
+]))
+assert.equal(rotated[0].layoutWidth, 1440)
+assert.equal(rotated[0].layoutHeight, 2560)
+assert.equal(Model.anyOverlap(rotated), false)
+
+// Packing an unseen monitor beside a rotated preset entry reserves its narrow
+// side.
+const portraitPreset = {
+  monitors: ["Portrait"],
+  layout: [{
+    identity: "Portrait",
+    name: "DP-1",
+    disabled: false,
+    mode: "2560x1440@60",
+    position: "0x0",
+    scale: 1,
+    transform: 1
+  }],
+  updated: "2026-01-01T00:00:00Z"
+}
+const unseen = {
+  name: "HDMI-A-1",
+  description: "New Panel",
+  identity: "New Panel",
+  enabled: true,
+  pendingResolution: "1920x1080",
+  pendingRefresh: "60",
+  scale: 1,
+  transform: 0,
+  layoutWidth: 1920,
+  layoutHeight: 1080,
+  x: 5000,
+  y: 0
+}
+const portraitRules = Model.presetRules(portraitPreset, [rotated[0], unseen])
+assert.equal(portraitRules.find(rule => rule.name === "HDMI-A-1").position, "1440x0")
+
 console.log("model tests passed")

@@ -64,6 +64,10 @@ function fourGrid() {
 for (const makeLayout of [fiveWide, fourGrid]) {
   const monitors = makeLayout()
   for (const target of monitors) {
+    // A regression that returned null everywhere would satisfy the invariant
+    // below, so require a result where one must exist.
+    assert.ok(Model.resolveDrag(monitors, target.name, target.x, target.y) !== null,
+      target.name + " at its own position")
     for (let gx = -5120; gx <= 8448; gx += 640) {
       for (let gy = -2880; gy <= 4320; gy += 360) {
         const result = Model.resolveDrag(monitors, target.name, gx, gy)
@@ -74,6 +78,10 @@ for (const makeLayout of [fiveWide, fourGrid]) {
     }
   }
 }
+assert.ok(Model.resolveDrag(fiveWide(), "A", 8448, 0) !== null,
+  "fiveWide: free spot right of the row")
+assert.ok(Model.resolveDrag(fourGrid(), "D", 8448, 0) !== null,
+  "fourGrid: free spot right of the grid")
 console.log("drag sweep invariant passed")
 
 // Edge snapping: near-adjacent positions snap exactly and report the axis.
@@ -146,6 +154,19 @@ console.log("drag pocket passed")
   const result = Model.resolveDrag(monitors, "A", 3000, 0)
   assert.equal(result.x, 3000)
   assertClean(monitors, "A", result, "A over disabled B")
+}
+
+// A rotated panel's footprint comes from parseMonitors: a landscape panel
+// dropped beside a portrait one lands next to it instead of being pushed down.
+{
+  const monitors = Model.parseMonitors(JSON.stringify([
+    { name: "P", description: "Portrait", width: 2560, height: 1440, x: 0, y: 0, scale: 1, refreshRate: 60, transform: 1 },
+    { name: "W", description: "Landscape", width: 2560, height: 1440, x: 1440, y: 0, scale: 1, refreshRate: 60, transform: 0 }
+  ]))
+  const beside = Model.resolveDrag(monitors, "W", 1440, 0)
+  assertClean(monitors, "W", beside, "W beside portrait P")
+  assert.equal(beside.x, 1440)
+  assert.equal(beside.y, 0)
 }
 
 // Unknown or disabled targets, and bad input, resolve to null.

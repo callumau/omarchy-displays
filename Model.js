@@ -229,6 +229,16 @@ function parseMonitors(raw) {
     if (refresh === "") refresh = String(Number(refreshRate.toFixed(2)))
 
     var description = String(item.description || "").slice(0, 256)
+    var transform = clampInteger(item.transform, 0, 7, 0)
+    // hyprctl reports the mode's pixel size, so a 90/270 degree rotation swaps
+    // the on-screen footprint that overlap and packing math has to use.
+    var layoutWidth = Math.max(1, Math.round(width / scale))
+    var layoutHeight = Math.max(1, Math.round(height / scale))
+    if (transform % 2 === 1) {
+      var swapped = layoutWidth
+      layoutWidth = layoutHeight
+      layoutHeight = swapped
+    }
     out.push({
       name: name,
       description: description,
@@ -239,12 +249,12 @@ function parseMonitors(raw) {
       pendingHeight: height,
       logicalWidth: Math.max(1, Math.round(width / scale)),
       logicalHeight: Math.max(1, Math.round(height / scale)),
-      layoutWidth: Math.max(1, Math.round(width / scale)),
-      layoutHeight: Math.max(1, Math.round(height / scale)),
+      layoutWidth: layoutWidth,
+      layoutHeight: layoutHeight,
       x: clampInteger(item.x, -100000, 100000, 0),
       y: clampInteger(item.y, -100000, 100000, 0),
       scale: scale,
-      transform: clampInteger(item.transform, 0, 7, 0),
+      transform: transform,
       refreshRate: refreshRate,
       enabled: item.disabled !== true,
       focused: item.focused === true,
@@ -571,8 +581,11 @@ function presetRules(preset, monitors) {
 
     var entryScale = isFinite(Number(entry.scale)) ? Number(entry.scale) : monitor.scale
     var entryMode = parseModeString(entry.mode)
+    var entryTransform = isFinite(Number(entry.transform)) ? Number(entry.transform) : monitor.transform
+    // Packing advances by the entry's on-screen width, so a rotated entry
+    // reserves its mode height instead.
     var entryWidth = entryMode
-      ? Math.max(1, Math.round(entryMode.width / entryScale))
+      ? Math.max(1, Math.round((entryTransform % 2 === 1 ? entryMode.height : entryMode.width) / entryScale))
       : (monitor.layoutWidth || monitor.logicalWidth)
 
     rules.push({
@@ -582,7 +595,7 @@ function presetRules(preset, monitors) {
       mode: String(entry.mode || modeString(monitor.pendingResolution, monitor.pendingRefresh)),
       position: position,
       scale: entryScale,
-      transform: isFinite(Number(entry.transform)) ? Number(entry.transform) : monitor.transform,
+      transform: entryTransform,
       disabled: false
     })
 

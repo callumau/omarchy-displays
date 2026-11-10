@@ -82,4 +82,34 @@ if bash "$script_dir/../apply-displays.sh" '{"pending":[]}' --save-trial >/dev/n
   exit 1
 fi
 
+# Rules that would break monitors.conf or the generated Lua are refused before
+# monitors.conf is written and before anything reaches the live layout.
+conf="$HOME/.config/hypr/monitors.conf"
+cp "$conf" "$tmp/monitors.conf.before"
+reject() {
+  local payload="$1" field="$2" err
+  : > "$EVAL_LOG"
+  if err=$(bash "$script_dir/../apply-displays.sh" "$payload" --remember 2>&1 >/dev/null); then
+    echo "accepted invalid payload ($field): $payload" >&2
+    exit 1
+  fi
+  grep -q "invalid $field" <<<"$err" || {
+    echo "failure did not name $field: $err" >&2
+    exit 1
+  }
+  test ! -s "$EVAL_LOG"
+  cmp -s "$conf" "$tmp/monitors.conf.before" || {
+    echo "monitors.conf changed while rejecting $field" >&2
+    exit 1
+  }
+}
+
+reject '[{"name":"DP-1\", disabled = true --","identity":"Hostile","description":"Hostile","mode":"2560x1440@59.95","position":"0x0","scale":1,"transform":0,"disabled":false}]' name
+reject '[{"name":"DP 1","identity":"Hostile","description":"Hostile","mode":"2560x1440@59.95","position":"0x0","scale":1,"transform":0,"disabled":false}]' name
+reject '[{"name":"DP-1","identity":"Hostile","description":"Dell \"wide\" panel","mode":"2560x1440@59.95","position":"0x0","scale":1,"transform":0,"disabled":false}]' description
+
+# apply-order.py cannot apply these, so they must fail before the config write.
+reject '[{"name":"DP-1","identity":"Hostile","description":"Hostile","mode":"preferred","position":"0x0","scale":1,"transform":0,"disabled":false}]' mode
+reject '[{"name":"DP-1","identity":"Hostile","description":"Hostile","mode":"2560x1440@59.95","position":"auto","scale":1,"transform":0,"disabled":false}]' position
+
 echo "apply-displays tests passed"

@@ -78,40 +78,47 @@ script_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 if command -v flock >/dev/null 2>&1; then
   mkdir -p "$HOME/.config/omarchy"
   exec 9>"$HOME/.config/omarchy/.monitor-layout.lock"
-  flock 9
+  # A hung apply must not block every later hotplug restore without a word.
+  flock -w 15 9 || fail "another apply is still running"
 fi
 
 jq -e . >/dev/null 2>&1 <<<"$payload" || fail "payload is not valid JSON"
 
+# Names the first field that fails validation, or prints nothing. Naming the
+# field keeps the panel's error useful: "invalid mode" says what to fix.
 VALIDATE_JQ='
 def valid_name: type == "string" and test("^[A-Za-z0-9._:-]{1,64}$");
-def valid_identity:
-  type == "string" and length > 0 and length <= 256 and (test("[[:cntrl:]]") | not);
-def valid_description:
-  type == "string" and length <= 256 and (test("[[:cntrl:]]") | not);
+# A quote or backslash would break the monitors.conf line the label is
+# written into.
+def clean_text:
+  type == "string" and (test("[[:cntrl:]]") | not)
+  and (contains("\"") | not) and (contains("\\") | not);
+def valid_identity: clean_text and length > 0 and length <= 256;
+def valid_description: clean_text and length <= 256;
 def valid_mode:
-  type == "string" and test("^(preferred|[0-9]{2,5}x[0-9]{2,5}@[0-9]{1,3}(\\.[0-9]+)?)$");
+  type == "string" and test("^[0-9]{2,5}x[0-9]{2,5}@[0-9]{1,3}(\\.[0-9]+)?$");
 def valid_position:
-  type == "string" and test("^(auto|-?[0-9]{1,6}x-?[0-9]{1,6})$");
-def valid_rule:
-  (.name | valid_name)
-  and (.identity | valid_identity)
-  and ((.description // "") | valid_description)
-  and (
-    if .disabled == true then true
-    else
-      (.mode | valid_mode)
-      and (.position | valid_position)
-      and (.scale | type == "number" and . >= 0.1 and . <= 10)
-      and (.transform | type == "number" and . == floor and . >= 0 and . <= 7)
-    end
-  );
-if (type == "array" and length >= 1 and length <= 32 and all(.[]; valid_rule))
-then . else error("invalid monitor layout payload") end
+  type == "string" and test("^-?[0-9]{1,6}x-?[0-9]{1,6}$");
+def rule_field:
+  if (type != "object") then "rule"
+  elif (.name | valid_name | not) then "name"
+  elif (.identity | valid_identity | not) then "identity"
+  elif ((.description // "") | valid_description | not) then "description"
+  elif .disabled == true then empty
+  elif (.mode | valid_mode | not) then "mode"
+  elif (.position | valid_position | not) then "position"
+  elif ((.scale | type == "number" and . >= 0.1 and . <= 10) | not) then "scale"
+  elif ((.transform | type == "number" and . == floor and . >= 0 and . <= 7) | not)
+  then "transform"
+  else empty end;
+if (type != "array" or length < 1 or length > 32) then "rules"
+else (map(rule_field) | map(select(. != null)) | first) // empty
+end
 '
 
-jq -e "$VALIDATE_JQ" >/dev/null 2>&1 <<<"$payload" \
+invalid_field=$(jq -r "$VALIDATE_JQ" <<<"$payload") \
   || fail "invalid monitor layout payload"
+[[ -z $invalid_field ]] || fail "invalid $invalid_field in monitor layout payload"
 
 CONFIG_JQ='
 def output_label:
@@ -164,9 +171,12 @@ remember_layout() {
   local existing='{"version":1,"presets":[]}'
   if [[ -f $presets ]]; then
     existing=$(cat "$presets")
-  fi
-  if ! jq -e '.presets | type == "array"' >/dev/null 2>&1 <<<"$existing"; then
-    existing='{"version":1,"presets":[]}'
+    if ! jq -e '.presets | type == "array"' >/dev/null 2>&1 <<<"$existing"; then
+      # Never drop presets silently: keep what we could not read.
+      cp -f "$presets" "$presets.bak"
+      echo "apply-displays: monitor-presets.json is unreadable, kept a copy at $presets.bak" >&2
+      existing='{"version":1,"presets":[]}'
+    fi
   fi
 
   presets_tmp=$(mktemp "$presets_dir/.monitor-presets.XXXXXX")
@@ -175,6 +185,7 @@ remember_layout() {
     | .presets = (([.presets[]? | select(.monitors != $entry.monitors)] + [$entry])
         | sort_by(.updated) | .[-32:])
   ' <<<"$existing" > "$presets_tmp"
+  chmod 0644 "$presets_tmp"
   mv "$presets_tmp" "$presets"
   presets_tmp=""
 
@@ -217,6 +228,8 @@ if [[ $action != "--live-only" ]]; then
   if [[ -f $conf ]]; then
     cp -f "$conf" "$conf.bak"
   fi
+  # mktemp creates 0600 and mv keeps it; the user's tools want to read this.
+  chmod 0644 "$tmp"
   mv "$tmp" "$conf"
   tmp=""
 fi

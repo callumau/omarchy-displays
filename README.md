@@ -150,6 +150,18 @@ bash tests/apply-displays.test.sh
 The shell and Python tests use a fake `hyprctl`, so they do not touch the
 running compositor.
 
+Before tagging a release, prove the widget still loads in a real shell:
+
+```bash
+bash tests/load-check.sh
+```
+
+A QML error that makes Quickshell drop the widget (an assignment to a read-only
+property, a bad member, an unset required property) is invisible to the unit
+tests above and only reported on a fresh shell start, so this restarts the
+Omarchy shell with the working tree installed and fails on
+`Plugin widget io.github.callumau.displays failed`. The bar blinks while it runs.
+
 ## Uninstall
 
 ```bash

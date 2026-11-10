@@ -17,7 +17,8 @@ jobs:
         run: |
           jq -e '.schemaVersion == 1' manifest.json
           jq -e '.id == "io.github.callumau.displays"' manifest.json
-          jq -e '.kinds | index("bar-widget") and index("service")' manifest.json
+          jq -e '.kinds | index("bar-widget") and index("service")' \
+            manifest.json
           jq -r '.entryPoints[]' manifest.json | while read -r entry; do
             test -f "$entry"
           done
@@ -26,6 +27,7 @@ jobs:
       - name: Check scripts and Python
         run: |
           bash -n apply-displays.sh
+          bash -n tests/load-check.sh
           python3 -m py_compile apply-order.py
 
       - name: Run tests

@@ -83,6 +83,9 @@ Panel {
   }
 
   readonly property string homeDir: Quickshell.env("HOME")
+  // Null-safe bar accessor: the shell also instantiates this panel without a bar
+  // (preview/thumbnail), where every `bar.x` read throws on each re-evaluation.
+  readonly property string barFontFamily: bar ? bar.fontFamily : Style.font.family
   readonly property string trialPath: homeDir + "/.config/omarchy/.monitor-trial.json"
 
   readonly property var layoutMonitors: {
@@ -197,6 +200,15 @@ Panel {
   // base-size so the knob doesn't snap back during the file round-trip. -1 =
   // no pending change; follow Style.font.baseSize.
   property int textSizePreviewIndex: -1
+  // Same queue as brightness: a stop chosen while the CLI runs must still land.
+  property int pendingTextPx: 0
+  property bool textSizeQueued: false
+  // Trial persistence intent ("save"/"clear"), drained when no child runs.
+  property string trialIntent: ""
+  property bool trialResumed: false
+  // Queued scale pick, so a click during an in-flight pick is not dropped.
+  property string pendingScale: ""
+  property real dragStartScale: 1
 
   // A text-size change reflows the whole panel (both font and spacing scale),
   // which slides rows under a stationary pointer and fires synthetic hover.
@@ -284,6 +296,10 @@ Panel {
   }
 
   function activateCursor() {
+    // The cursor model only exists on the Display tab. Without this guard a stale
+    // focusSection replays there: Space in the Layout tab would blank a monitor
+    // or change the scale.
+    if (activeTab !== "display") return
     if (focusSection === "scale" && selectedIndex >= 0 && selectedIndex < scaleValues.length) {
       setScale(scaleValues[selectedIndex])
       return
@@ -401,7 +417,9 @@ Panel {
     // stateProc (brightness probe) costs ~0.8s; only run it for the Display
     // tab that reads it. The Layout tab's layoutProc answers in ~15ms.
     if (activeTab === "display" && !stateProc.running) stateProc.running = true
-    if ((!layoutDirty || confirmPending) && !layoutProc.running) layoutProc.running = true
+    // Poll the layout once the tab exists, dirty or not: otherwise a hotplug
+    // with unsaved edits is never seen and the canvas keeps ghost cards.
+    if ((layoutBuilt || confirmPending) && !layoutProc.running) layoutProc.running = true
   }
 
   function refreshLayout() {
@@ -467,6 +485,10 @@ Panel {
 
   function updateDisplays(displaysJson) {
     var parsed = Model.parseDisplays(displaysJson)
+    // The 5s poll hands over fresh arrays; assigning them rebuilds every
+    // delegate and resets the hover highlight under a stationary pointer.
+    if (root.enabledDisplayCount === parsed.enabledDisplayCount
+        && JSON.stringify(root.displays) === JSON.stringify(parsed.displays)) return
     root.displays = parsed.displays
     root.enabledDisplayCount = parsed.enabledDisplayCount
   }
@@ -542,19 +564,21 @@ Panel {
     if (!monitors || monitors.length === 0) return
 
     var sameNames = sameMonitorSet(monitors)
+    var droppedTrial = false
 
     // A hotplug during the confirmation prompt changes the display set under
     // the pending trial. Drop the prompt and let the new snapshot (and the
     // preset watcher) take over. The first snapshot after a (re)load populates
-    // the canvas behind the resumed prompt instead.
+    // the canvas behind the resumed prompt instead. The trial layout stays
+    // live, so say so and keep the layout dirty — Apply/Revert must stay
+    // reachable instead of stranding a divergence no config describes.
     if (confirmPending) {
       if (sameNames) return
       if (layoutNames.length > 0) {
         confirmPending = false
         confirmTimer.stop()
         clearTrial()
-        layoutStatusKey = ""
-        layoutStatusDetail = ""
+        droppedTrial = true
       }
     }
     var resumingTrial = confirmPending
@@ -569,6 +593,13 @@ Panel {
       return
     }
     acceptOverlapSnapshot = false
+
+    // Polling runs with unsaved edits too. Same display set means keep the
+    // edited geometry and only refresh the live baseline that Revert uses.
+    if (sameNames && layoutDirty && !droppedTrial) {
+      liveLayoutRules = rulesFromMonitors(monitors)
+      return
+    }
 
     var next = {}
     var names = []
@@ -586,10 +617,13 @@ Panel {
     liveLayoutRules = rulesFromMonitors(monitors)
     layoutState = next
     if (!sameNames) layoutNames = names
+    // A delegate destroyed mid-drag never delivers `released`.
+    if (names.indexOf(dragMonitorName) < 0) endDragMonitor()
     if (!resumingTrial) {
-      layoutDirty = false
-      layoutStatusKey = ""
+      layoutStatusKey = droppedTrial ? "layout.trialDropped"
+        : (layoutDirty ? "layout.displaySetChanged" : "")
       layoutStatusDetail = ""
+      layoutDirty = droppedTrial
       snapX = false
       snapY = false
     }
@@ -597,6 +631,8 @@ Panel {
   }
 
   function resumeTrial(raw) {
+    if (trialResumed) return
+    trialResumed = true
     var trial = null
     try {
       trial = JSON.parse(String(raw || ""))
@@ -688,14 +724,16 @@ Panel {
     snapY = resolved.snappedY
     snapGuideY = resolved.y
     layoutDirty = true
-    layoutStatusKey = ""
-    layoutStatusDetail = ""
   }
 
   function endDragMonitor() {
     dragMonitorName = ""
     snapX = false
     snapY = false
+    // Clear the status on drop rather than on every pointer move, so a
+    // divergence message survives a nudge.
+    layoutStatusKey = ""
+    layoutStatusDetail = ""
     // Refit the canvas to the dropped arrangement so the whole layout stays
     // in view after a long drag.
     recomputeCanvas()
@@ -713,8 +751,11 @@ Panel {
     if (pendingWidth > 0 && pendingHeight > 0) {
       next.pendingWidth = pendingWidth
       next.pendingHeight = pendingHeight
-      next.layoutWidth = Math.max(1, Math.round(pendingWidth / next.scale))
-      next.layoutHeight = Math.max(1, Math.round(pendingHeight / next.scale))
+      // hyprctl reports mode pixels, so a 90/270 degree rotation swaps the
+      // footprint — same rule as Model.parseMonitors.
+      var rotated = next.transform % 2 === 1
+      next.layoutWidth = Math.max(1, Math.round((rotated ? pendingHeight : pendingWidth) / next.scale))
+      next.layoutHeight = Math.max(1, Math.round((rotated ? pendingWidth : pendingHeight) / next.scale))
     }
 
     var rates = Model.refreshRatesFor(next.availableModes, resolution)
@@ -860,20 +901,31 @@ Panel {
     }
   }
 
-  function saveTrial() {
+  function saveTrial() { writeTrial("save") }
+  function clearTrial() { writeTrial("clear") }
+
+  // Trial persistence drains through one deferred intent: a clear issued while
+  // the save is still exiting must not be dropped, or a future-dated trial file
+  // survives and the next reload reverts the layout the user just kept.
+  function writeTrial(intent) {
     if (pluginDir === "") return
-    if (trialSaveProc.running) return
-    trialSaveProc.command = ["bash", pluginDir + "/apply-displays.sh",
-      JSON.stringify(trialPayload()), "--save-trial"]
-    trialSaveProc.running = true
+    trialIntent = intent
+    pumpTrial()
   }
 
-  function clearTrial() {
-    if (pluginDir === "") return
-    if (trialClearProc.running) return
-    trialClearProc.command = ["bash", pluginDir + "/apply-displays.sh",
-      "--clear-trial"]
-    trialClearProc.running = true
+  function pumpTrial() {
+    if (trialIntent === "" || trialSaveProc.running || trialClearProc.running) return
+    var intent = trialIntent
+    trialIntent = ""
+    if (intent === "save") {
+      trialSaveProc.command = ["bash", pluginDir + "/apply-displays.sh",
+        JSON.stringify(trialPayload()), "--save-trial"]
+      trialSaveProc.running = true
+    } else {
+      trialClearProc.command = ["bash", pluginDir + "/apply-displays.sh",
+        "--clear-trial"]
+      trialClearProc.running = true
+    }
   }
 
   function startConfirmation() {
@@ -910,7 +962,8 @@ Panel {
     if (!confirmPending || applyProc.running) return
     confirmTimer.stop()
     confirmPending = false
-    clearTrial()
+    // The trial file is cleared by the --commit exit path, not here: a failed
+    // commit must keep the trial resumable.
     applyMode = "keep"
     layoutStatusKey = "layout.saving"
     layoutStatusDetail = ""
@@ -936,9 +989,15 @@ Panel {
     applyProc.running = true
   }
 
+  // argv rather than a shell string, and its own process so a scale pick is not
+  // lost behind an in-flight display toggle.
   function setScale(scale) {
-    actionProc.command = ["bash", "-c", "omarchy-hyprland-monitor-scaling " + scale]
-    if (!actionProc.running) actionProc.running = true
+    if (scaleProc.running) {
+      root.pendingScale = String(scale)
+      return
+    }
+    scaleProc.command = ["omarchy-hyprland-monitor-scaling", String(scale)]
+    scaleProc.running = true
   }
 
   // ---- Text size (shell base font + GTK text-scaling, via one CLI) ----
@@ -965,8 +1024,17 @@ Panel {
   }
 
   function setTextSize(px) {
-    textScaleProc.command = ["omarchy-display-text-size", String(px)]
-    if (!textScaleProc.running) textScaleProc.running = true
+    var value = Math.round(px)
+    root.pendingTextPx = value
+    if (textScaleProc.running) {
+      // A stop chosen while the CLI runs must still land; dropping it left the
+      // slider pinned to a stop the shell never applied.
+      root.textSizeQueued = true
+      return
+    }
+    root.textSizeQueued = false
+    textScaleProc.command = ["omarchy-display-text-size", String(value)]
+    textScaleProc.running = true
   }
 
   function adjustTextSize(deltaSteps) {
@@ -983,10 +1051,10 @@ Panel {
 
   Component.onCompleted: {
     refresh()
-    // blockLoading makes the trial text available on the first read, so a
-    // reload mid-confirmation resumes the prompt instead of stranding it.
-    resumeTrial(trialFile.text())
   }
+
+  // A resumed trial arrives through FileView.onLoaded (blockLoading makes the
+  // text available on the first read), so there is exactly one resume path.
 
   // KeyboardPanel primes focus at open-time, so SUPER-bound IPC summons land
   // with j/k ready to navigate. Keep a default landing point, but don't paint
@@ -1002,8 +1070,17 @@ Panel {
         selectedIndex = 0
       }
       cursorActive = false
+    } else {
+      // A drag whose delegate died mid-press (close while held) never delivers
+      // `released`, which would leave the snap guides painted on the canvas.
+      dragMonitorName = ""
+      snapX = false
+      snapY = false
     }
   }
+  // Resumed trials never change the overlay's visibility, so claim the keys when
+  // the prompt appears rather than only when it is first shown.
+  onConfirmPendingChanged: if (confirmPending && opened) confirmOverlay.forceActiveFocus()
   onBrightnessAvailableChanged: clampCursor()
   onDisplaysChanged: clampCursor()
   onScaleValuesChanged: clampCursor()
@@ -1070,6 +1147,7 @@ Panel {
           root.layoutStatusDetail = ""
           root.layoutDirty = false
           root.confirmPending = false
+          root.clearTrial()
           root.refresh()
           return
         }
@@ -1091,7 +1169,8 @@ Panel {
       } else if (root.applyMode === "revert") {
         root.layoutStatusKey = "layout.revertFailed"
         root.layoutStatusDetail = error
-        root.layoutDirty = false
+        // The live layout is still the pending one, so keep Apply/Revert alive.
+        root.layoutDirty = true
       } else {
         root.layoutStatusKey = "layout.failed"
         root.layoutStatusDetail = error
@@ -1101,16 +1180,47 @@ Panel {
     }
   }
 
+  // A stuck child (flock wait, hung hyprctl) must not wedge the Layout tab:
+  // applyRunning gates Apply, Keep and Revert.
+  Timer {
+    id: applyWatchdog
+    interval: 25000
+    repeat: false
+    running: root.applyRunning
+    onTriggered: {
+      if (!applyProc.running) return
+      applyProc.running = false
+      root.applyRunning = false
+      root.layoutStatusKey = "layout.failed"
+      root.layoutStatusDetail = "timed out"
+    }
+  }
+
   // Trial persistence: a reload mid-confirmation must not strand the trial
   // layout. The file is written on Apply and cleared on Keep, revert, or drop.
   Process {
     id: trialSaveProc
     stdout: StdioCollector { waitForEnd: true }
+    stderr: StdioCollector { id: trialSaveError; waitForEnd: true }
+    onExited: function(exitCode) {
+      if (exitCode !== 0)
+        console.warn("displays: could not save trial: " + String(trialSaveError.text || "").trim())
+      root.pumpTrial()
+    }
   }
 
   Process {
     id: trialClearProc
     stdout: StdioCollector { waitForEnd: true }
+    stderr: StdioCollector { id: trialClearError; waitForEnd: true }
+    onExited: function(exitCode) {
+      if (exitCode !== 0) {
+        // A clear that keeps failing would let a later reload revert a layout
+        // the user already kept, so at least say so.
+        console.warn("displays: could not clear trial: " + String(trialClearError.text || "").trim())
+      }
+      root.pumpTrial()
+    }
   }
 
   FileView {
@@ -1131,7 +1241,10 @@ Panel {
         var lines = String(text || "").split("\n")
         var brightness = String(lines[0] || "").trim()
         root.brightnessAvailable = brightness !== "unavailable" && brightness !== ""
-        root.brightnessPercent = root.brightnessAvailable ? Math.max(0, Math.min(100, parseInt(brightness, 10))) : 0
+        // A poll that lands mid-write echoes the pre-change hardware value, so
+        // leave the optimistic percentage alone until the write has landed.
+        if (!setBrightnessProc.running && !root.brightnessSetQueued && !brightnessDebounce.running)
+          root.brightnessPercent = root.brightnessAvailable ? Math.max(0, Math.min(100, parseInt(brightness, 10))) : 0
         root.internalMonitor = String(lines[1] || "").trim()
         root.externalMonitor = String(lines[2] || "").trim()
         root.internalEnabled = String(lines[3] || "").trim() !== ""
@@ -1180,6 +1293,30 @@ Panel {
   Process {
     id: textScaleProc
     stdout: StdioCollector { waitForEnd: true }
+    stderr: StdioCollector { id: textScaleError; waitForEnd: true }
+    onRunningChanged: {
+      if (running) return
+      if (root.textSizeQueued) root.setTextSize(root.pendingTextPx)
+    }
+    onExited: function(exitCode) {
+      if (exitCode === 0) return
+      // The stop never reached the shell: drop the optimistic preview so the
+      // slider and label follow the live base size again.
+      root.textSizePreviewIndex = -1
+      console.warn("displays: text size failed: " + String(textScaleError.text || "").trim())
+    }
+  }
+
+  Process {
+    id: scaleProc
+    stdout: StdioCollector { waitForEnd: true }
+    onExited: function(exitCode) {
+      var queued = root.pendingScale
+      root.pendingScale = ""
+      if (queued !== "") root.setScale(queued)
+      if (exitCode !== 0) console.warn("displays: scaling command failed")
+      root.refresh()
+    }
   }
 
   // Clears the hover-suppression flag once the reflow triggered by a text-size
@@ -1277,8 +1414,8 @@ Panel {
               id: heroIcon
               textFormat: Text.PlainText
               text: root.displays.length > 1 ? "󰍺" : "󰍹"
-              color: root.bar.foreground
-              font.family: root.bar.fontFamily
+              color: root.barForeground
+              font.family: root.barFontFamily
               font.pixelSize: Style.font.display
               anchors.left: parent.left
               anchors.verticalCenter: parent.verticalCenter
@@ -1297,8 +1434,8 @@ Panel {
                   ? strings.t("layout.title")
                   : Commons.I18n.t("monitor.display")
                 textFormat: Text.PlainText
-                color: root.bar.foreground
-                font.family: root.bar.fontFamily
+                color: root.barForeground
+                font.family: root.barFontFamily
                 font.pixelSize: Style.font.title
                 font.bold: true
                 elide: Text.ElideRight
@@ -1316,8 +1453,8 @@ Panel {
                   }
                   return Commons.I18n.t("monitor.fixedBrightness")
                 }
-                color: Qt.darker(root.bar.foreground, 1.4)
-                font.family: root.bar.fontFamily
+                color: Qt.darker(root.barForeground, 1.4)
+                font.family: root.barFontFamily
                 font.pixelSize: Style.font.caption
                 font.bold: true
                 font.letterSpacing: 1.2
@@ -1337,8 +1474,8 @@ Panel {
               width: (tabRow.width - tabRow.spacing) / 2
               text: strings.t("tab.display")
               fontSize: Style.font.body
-              foreground: root.bar.foreground
-              fontFamily: root.bar.fontFamily
+              foreground: root.barForeground
+              fontFamily: root.barFontFamily
               horizontalPadding: Style.spacing.sm
               verticalPadding: Style.spacing.controlPaddingY
               bordered: true
@@ -1350,8 +1487,8 @@ Panel {
               width: (tabRow.width - tabRow.spacing) / 2
               text: strings.t("tab.layout")
               fontSize: Style.font.body
-              foreground: root.bar.foreground
-              fontFamily: root.bar.fontFamily
+              foreground: root.barForeground
+              fontFamily: root.barFontFamily
               horizontalPadding: Style.spacing.sm
               verticalPadding: Style.spacing.controlPaddingY
               bordered: true
@@ -1363,7 +1500,7 @@ Panel {
           // ---------- Brightness ----------
           PanelSeparator {
             visible: root.activeTab === "display" && root.brightnessAvailable
-            foreground: root.bar.foreground
+            foreground: root.barForeground
           }
 
           Column {
@@ -1378,8 +1515,8 @@ Panel {
               PanelSectionHeader {
                 id: brightnessHeader
                 text: Commons.I18n.t("monitor.brightness")
-                foreground: root.bar.foreground
-                fontFamily: root.bar.fontFamily
+                foreground: root.barForeground
+                fontFamily: root.barFontFamily
                 anchors.left: parent.left
                 anchors.verticalCenter: parent.verticalCenter
               }
@@ -1388,8 +1525,8 @@ Panel {
                 id: brightnessPercent
                 textFormat: Text.PlainText
                 text: Commons.I18n.formatNumber(Math.round(brightnessSlider.dragging ? brightnessSlider.liveValue : root.brightnessPercent)) + "%"
-                color: Qt.darker(root.bar.foreground, 1.4)
-                font.family: root.bar.fontFamily
+                color: Qt.darker(root.barForeground, 1.4)
+                font.family: root.barFontFamily
                 font.pixelSize: Style.font.caption
                 font.bold: true
                 anchors.right: parent.right
@@ -1404,7 +1541,7 @@ Panel {
               height: brightnessSlider.implicitHeight + Style.spacing.controlGap
               hasCursor: root.cursorActive && root.focusSection === "brightness" && root.selectedIndex === -1
               onHasCursorChanged: if (hasCursor) root.ensureCursorVisible(brightnessRow)
-              foreground: root.bar.foreground
+              foreground: root.barForeground
               outline: true
 
               PanelSlider {
@@ -1438,7 +1575,7 @@ Panel {
           // ---------- Text size ----------
           PanelSeparator {
             visible: root.activeTab === "display"
-            foreground: root.bar.foreground
+            foreground: root.barForeground
           }
 
           Column {
@@ -1453,8 +1590,8 @@ Panel {
               PanelSectionHeader {
                 id: textSizeHeader
                 text: Commons.I18n.t("monitor.textSize")
-                foreground: root.bar.foreground
-                fontFamily: root.bar.fontFamily
+                foreground: root.barForeground
+                fontFamily: root.barFontFamily
                 anchors.left: parent.left
                 anchors.verticalCenter: parent.verticalCenter
               }
@@ -1465,8 +1602,8 @@ Panel {
                 text: Commons.I18n.formatNumber(textSizeSlider.dragging
                        ? root.textSizeStops[Math.round(textSizeSlider.liveValue)]
                        : root.displayedTextPx()) + "px"
-                color: Qt.darker(root.bar.foreground, 1.4)
-                font.family: root.bar.fontFamily
+                color: Qt.darker(root.barForeground, 1.4)
+                font.family: root.barFontFamily
                 font.pixelSize: Style.font.caption
                 font.bold: true
                 anchors.right: parent.right
@@ -1481,7 +1618,7 @@ Panel {
               height: textSizeSlider.implicitHeight + Style.spacing.controlGap
               hasCursor: root.cursorActive && root.focusSection === "textsize" && root.selectedIndex === -1
               onHasCursorChanged: if (hasCursor) root.ensureCursorVisible(textSizeRow)
-              foreground: root.bar.foreground
+              foreground: root.barForeground
               outline: true
 
               PanelSlider {
@@ -1496,7 +1633,11 @@ Panel {
                 integer: true
                 tickCount: root.textSizeStops.length
                 value: root.currentTextIndex()
-                onReleased: function(v) { root.setTextSize(root.textSizeStops[Math.round(v)]) }
+                onReleased: function(v) {
+                  // Same path as the keyboard stops: sets the preview and
+                  // suppresses hover hijack while the reflow lands.
+                  root.adjustTextSize(Math.round(v) - root.currentTextIndex())
+                }
               }
 
               HoverHandler {
@@ -1512,7 +1653,7 @@ Panel {
           // ---------- Scale ----------
           PanelSeparator {
             visible: root.activeTab === "display"
-            foreground: root.bar.foreground
+            foreground: root.barForeground
           }
 
           Column {
@@ -1527,8 +1668,8 @@ Panel {
               PanelSectionHeader {
                 id: scaleHeader
                 text: Commons.I18n.t("monitor.scale")
-                foreground: root.bar.foreground
-                fontFamily: root.bar.fontFamily
+                foreground: root.barForeground
+                fontFamily: root.barFontFamily
                 anchors.left: parent.left
                 anchors.verticalCenter: parent.verticalCenter
               }
@@ -1541,8 +1682,8 @@ Panel {
                 text: root.focusedMonitor
                 // Only worth naming when more than one display is in play.
                 visible: root.focusedMonitor !== "" && root.enabledDisplayCount > 1
-                color: Qt.darker(root.bar.foreground, 1.4)
-                font.family: root.bar.fontFamily
+                color: Qt.darker(root.barForeground, 1.4)
+                font.family: root.barFontFamily
                 font.pixelSize: Style.font.caption
                 font.bold: true
                 anchors.right: parent.right
@@ -1579,7 +1720,7 @@ Panel {
           // ---------- Monitors ----------
           PanelSeparator {
             visible: root.activeTab === "display" && root.displays.length > 1
-            foreground: root.bar.foreground
+            foreground: root.barForeground
           }
 
           Column {
@@ -1589,8 +1730,8 @@ Panel {
 
             PanelSectionHeader {
               text: Commons.I18n.t("monitor.displays")
-              foreground: root.bar.foreground
-              fontFamily: root.bar.fontFamily
+              foreground: root.barForeground
+              fontFamily: root.barFontFamily
             }
 
             Repeater {
@@ -1616,6 +1757,12 @@ Panel {
             visible: root.activeTab === "layout"
             active: root.layoutBuilt
             sourceComponent: layoutTabComponent
+            // Without this, a build failure is indistinguishable from a tab
+            // that renders at zero height; only the console would know.
+            onStatusChanged: if (status === Loader.Error) {
+              root.layoutStatusKey = "layout.failed"
+              root.layoutStatusDetail = "layout tab failed to build"
+            }
           }
 
           Component {
@@ -1632,8 +1779,8 @@ Panel {
               PanelSectionHeader {
                 id: layoutHeader
                 text: strings.t("layout.arrange")
-                foreground: root.bar.foreground
-                fontFamily: root.bar.fontFamily
+                foreground: root.barForeground
+                fontFamily: root.barFontFamily
                 anchors.left: parent.left
                 anchors.verticalCenter: parent.verticalCenter
               }
@@ -1642,8 +1789,8 @@ Panel {
                 id: layoutHint
                 textFormat: Text.PlainText
                 text: strings.t("layout.dragHint")
-                color: Qt.darker(root.bar.foreground, 1.4)
-                font.family: root.bar.fontFamily
+                color: Qt.darker(root.barForeground, 1.4)
+                font.family: root.barFontFamily
                 font.pixelSize: Style.font.caption
                 font.bold: true
                 anchors.right: parent.right
@@ -1669,8 +1816,8 @@ Panel {
 
               BorderSurface {
                 anchors.fill: parent
-                color: Style.normalFillFor(root.bar.foreground, Commons.Color.accent)
-                borderSpec: Border.controlSpec("normal", root.bar.foreground, Commons.Color.accent)
+                color: Style.normalFillFor(root.barForeground, Commons.Color.accent)
+                borderSpec: Border.controlSpec("normal", root.barForeground, Commons.Color.accent)
                 radius: Style.cornerRadius
               }
 
@@ -1691,10 +1838,10 @@ Panel {
                   height: Math.max(Style.space(26), (monitor.layoutHeight || 1) * root.canvasScale)
                   hasCursor: root.selectedLayoutName === modelData
                   bordered: true
-                  foreground: root.bar.foreground
+                  foreground: root.barForeground
                   accent: invalid ? Commons.Color.urgent : Commons.Color.accent
-                  fill: Style.hoverFillFor(root.bar.foreground, Commons.Color.accent)
-                  currentFill: Style.selectedFillFor(root.bar.foreground, Commons.Color.accent)
+                  fill: Style.hoverFillFor(root.barForeground, Commons.Color.accent)
+                  currentFill: Style.selectedFillFor(root.barForeground, Commons.Color.accent)
                   radius: Style.cornerRadius
 
                   Column {
@@ -1707,8 +1854,8 @@ Panel {
                       text: monitorCard.monitor.name || ""
                       color: monitorCard.hasCursor
                         ? Commons.Color.accent
-                        : root.bar.foreground
-                      font.family: root.bar.fontFamily
+                        : root.barForeground
+                      font.family: root.barFontFamily
                       font.pixelSize: Style.font.caption
                       font.bold: true
                       elide: Text.ElideRight
@@ -1721,8 +1868,8 @@ Panel {
                       visible: monitorCard.height > Style.space(48)
                       text: (monitorCard.monitor.pendingResolution || "")
                         + " · " + (monitorCard.monitor.pendingRefresh || "") + " Hz"
-                      color: Qt.darker(root.bar.foreground, 1.3)
-                      font.family: root.bar.fontFamily
+                      color: Qt.darker(root.barForeground, 1.3)
+                      font.family: root.barFontFamily
                       font.pixelSize: Style.font.caption
                       elide: Text.ElideRight
                       horizontalAlignment: Text.AlignHCenter
@@ -1735,7 +1882,7 @@ Panel {
                     visible: monitorCard.monitor.x === 0 && monitorCard.monitor.y === 0
                     text: "★"
                     color: Commons.Color.accent
-                    font.family: root.bar.fontFamily
+                    font.family: root.barFontFamily
                     font.pixelSize: Style.font.caption
                     anchors.top: parent.top
                     anchors.left: parent.left
@@ -1752,6 +1899,7 @@ Panel {
                       root.selectLayoutMonitor(monitorCard.modelData)
                       root.dragMonitorName = monitorCard.modelData
                       root.dragPressScene = monitorCard.mapToItem(null, mouse.x, mouse.y)
+                      root.dragStartScale = root.canvasScale
                       root.dragStartX = monitorCard.monitor.x || 0
                       root.dragStartY = monitorCard.monitor.y || 0
                     }
@@ -1759,8 +1907,10 @@ Panel {
                     onPositionChanged: function(mouse) {
                       if (!pressed || root.dragMonitorName !== monitorCard.modelData) return
                       var point = monitorCard.mapToItem(null, mouse.x, mouse.y)
-                      var dx = (point.x - root.dragPressScene.x) / root.canvasScale
-                      var dy = (point.y - root.dragPressScene.y) / root.canvasScale
+                      // Divide by the scale at press: a hotplug refits the canvas
+                      // mid-drag and would otherwise retro-scale the delta.
+                      var dx = (point.x - root.dragPressScene.x) / root.dragStartScale
+                      var dy = (point.y - root.dragPressScene.y) / root.dragStartScale
                       root.moveMonitor(monitorCard.modelData,
                         root.dragStartX + dx, root.dragStartY + dy)
                     }
@@ -1799,8 +1949,8 @@ Panel {
                 textFormat: Text.PlainText
                 visible: root.enabledLayoutMonitors.length === 0
                 text: strings.t("layout.noDisplays")
-                color: Qt.darker(root.bar.foreground, 1.3)
-                font.family: root.bar.fontFamily
+                color: Qt.darker(root.barForeground, 1.3)
+                font.family: root.barFontFamily
                 font.pixelSize: Style.font.body
                 anchors.centerIn: parent
               }
@@ -1819,8 +1969,8 @@ Panel {
 
                   text: monitor.name || modelData
                   fontSize: Style.font.caption
-                  foreground: root.bar.foreground
-                  fontFamily: root.bar.fontFamily
+                  foreground: root.barForeground
+                  fontFamily: root.barFontFamily
                   horizontalPadding: Style.spacing.sm
                   verticalPadding: Style.spacing.controlPaddingY
                   bordered: true
@@ -1839,8 +1989,8 @@ Panel {
                 width: (parent.width - parent.spacing * 2) / 3
                 text: strings.t("layout.arrangeButton")
                 fontSize: Style.font.caption
-                foreground: root.bar.foreground
-                fontFamily: root.bar.fontFamily
+                foreground: root.barForeground
+                fontFamily: root.barFontFamily
                 horizontalPadding: Style.spacing.xs
                 verticalPadding: Style.spacing.controlPaddingY
                 bordered: true
@@ -1852,8 +2002,8 @@ Panel {
                 width: (parent.width - parent.spacing * 2) / 3
                 text: strings.t("layout.swap")
                 fontSize: Style.font.caption
-                foreground: root.bar.foreground
-                fontFamily: root.bar.fontFamily
+                foreground: root.barForeground
+                fontFamily: root.barFontFamily
                 horizontalPadding: Style.spacing.xs
                 verticalPadding: Style.spacing.controlPaddingY
                 bordered: true
@@ -1865,8 +2015,8 @@ Panel {
                 width: (parent.width - parent.spacing * 2) / 3
                 text: strings.t("layout.primary")
                 fontSize: Style.font.caption
-                foreground: root.bar.foreground
-                fontFamily: root.bar.fontFamily
+                foreground: root.barForeground
+                fontFamily: root.barFontFamily
                 horizontalPadding: Style.spacing.xs
                 verticalPadding: Style.spacing.controlPaddingY
                 bordered: true
@@ -1878,7 +2028,7 @@ Panel {
             }
 
             PanelSeparator {
-              foreground: root.bar.foreground
+              foreground: root.barForeground
             }
 
             Column {
@@ -1901,8 +2051,8 @@ Panel {
                   Text {
                     textFormat: Text.PlainText
                     text: root.selectedMonitor ? root.selectedMonitor.name : ""
-                    color: root.bar.foreground
-                    font.family: root.bar.fontFamily
+                    color: root.barForeground
+                    font.family: root.barFontFamily
                     font.pixelSize: Style.font.subtitle
                     font.bold: true
                     elide: Text.ElideRight
@@ -1916,8 +2066,8 @@ Panel {
                         + " · " + (root.selectedMonitor.pendingResolution || "")
                         + " · " + Commons.I18n.formatNumber(root.selectedMonitor.scale) + "x"
                       : ""
-                    color: Qt.darker(root.bar.foreground, 1.4)
-                    font.family: root.bar.fontFamily
+                    color: Qt.darker(root.barForeground, 1.4)
+                    font.family: root.barFontFamily
                     font.pixelSize: Style.font.caption
                     elide: Text.ElideRight
                     width: parent.width
@@ -1933,8 +2083,8 @@ Panel {
                   text: root.selectedMonitor && root.selectedMonitor.enabled
                     ? strings.t("layout.on")
                     : strings.t("layout.off")
-                  color: Qt.darker(root.bar.foreground, 1.35)
-                  font.family: root.bar.fontFamily
+                  color: Qt.darker(root.barForeground, 1.35)
+                  font.family: root.barFontFamily
                   font.pixelSize: Style.font.caption
                   font.bold: true
                 }
@@ -1944,7 +2094,7 @@ Panel {
                   anchors.right: parent.right
                   anchors.verticalCenter: parent.verticalCenter
                   checked: root.selectedMonitor ? root.selectedMonitor.enabled : false
-                  foreground: root.bar.foreground
+                  foreground: root.barForeground
                   accent: Commons.Color.accent
                   onToggled: if (root.selectedMonitor)
                     root.setMonitorEnabled(root.selectedMonitor.name, !root.selectedMonitor.enabled)
@@ -1952,12 +2102,13 @@ Panel {
               }
 
               Dropdown {
+                id: resolutionDropdown
                 width: parent.width
                 label: strings.t("layout.resolution")
                 value: root.selectedMonitor ? root.selectedMonitor.pendingResolution : ""
                 options: root.resolutionDropdownOptions
-                foreground: root.bar.foreground
-                fontFamily: root.bar.fontFamily
+                foreground: root.barForeground
+                fontFamily: root.barFontFamily
                 enabled: root.selectedMonitor ? root.selectedMonitor.enabled : false
                 onChanged: function(value) {
                   if (root.selectedMonitor)
@@ -1966,18 +2117,34 @@ Panel {
               }
 
               Dropdown {
+                id: refreshDropdown
                 width: parent.width
                 label: strings.t("layout.refresh")
                 value: root.selectedMonitor ? root.selectedMonitor.pendingRefresh : ""
                 options: root.refreshDropdownOptions
-                foreground: root.bar.foreground
-                fontFamily: root.bar.fontFamily
+                foreground: root.barForeground
+                fontFamily: root.barFontFamily
                 enabled: root.selectedMonitor
                   ? (root.selectedMonitor.enabled && root.refreshDropdownOptions.length > 0)
                   : false
                 onChanged: function(value) {
                   if (root.selectedMonitor)
                     root.setMonitorRefresh(root.selectedMonitor.name, value)
+                }
+              }
+
+              // Dropdown writes its own `value` from JS on pick (Ui/Dropdown
+              // selectCurrent), which kills the caller's binding, and
+              // ToggleSwitch is caller-owned. Re-push both from the model so
+              // switching cards cannot show the previous monitor's settings.
+              Connections {
+                target: root
+                function onLayoutStateChanged() { pushDetailControls() }
+                function onSelectedLayoutNameChanged() { pushDetailControls() }
+                function pushDetailControls() {
+                  resolutionDropdown.value = root.selectedMonitor ? root.selectedMonitor.pendingResolution : ""
+                  refreshDropdown.value = root.selectedMonitor ? root.selectedMonitor.pendingRefresh : ""
+                  selectedEnabledToggle.checked = root.selectedMonitor ? root.selectedMonitor.enabled : false
                 }
               }
 
@@ -1988,7 +2155,7 @@ Panel {
                   ? strings.t("layout.overlapNamed").arg(root.overlapNames)
                   : strings.t("layout.overlap")
                 color: Commons.Color.urgent
-                font.family: root.bar.fontFamily
+                font.family: root.barFontFamily
                 font.pixelSize: Style.font.caption
                 font.bold: true
                 wrapMode: Text.Wrap
@@ -2006,8 +2173,8 @@ Panel {
                 }
                 color: root.layoutStatusKey === "layout.failed"
                   ? Commons.Color.urgent
-                  : Qt.darker(root.bar.foreground, 1.35)
-                font.family: root.bar.fontFamily
+                  : Qt.darker(root.barForeground, 1.35)
+                font.family: root.barFontFamily
                 font.pixelSize: Style.font.caption
                 wrapMode: Text.Wrap
                 width: parent.width
@@ -2021,8 +2188,8 @@ Panel {
                   width: (parent.width - parent.spacing) / 2
                   text: strings.t("layout.apply")
                   fontSize: Style.font.body
-                  foreground: root.bar.foreground
-                  fontFamily: root.bar.fontFamily
+                  foreground: root.barForeground
+                  fontFamily: root.barFontFamily
                   horizontalPadding: Style.spacing.sm
                   verticalPadding: Style.spacing.controlPaddingY
                   bordered: true
@@ -2039,8 +2206,8 @@ Panel {
                     ? strings.t("layout.revert")
                     : strings.t("layout.reload")
                   fontSize: Style.font.body
-                  foreground: root.bar.foreground
-                  fontFamily: root.bar.fontFamily
+                  foreground: root.barForeground
+                  fontFamily: root.barFontFamily
                   horizontalPadding: Style.spacing.sm
                   verticalPadding: Style.spacing.controlPaddingY
                   bordered: true
@@ -2052,8 +2219,8 @@ Panel {
               Text {
                 textFormat: Text.PlainText
                 text: strings.t("layout.rememberHint")
-                color: Qt.darker(root.bar.foreground, 1.5)
-                font.family: root.bar.fontFamily
+                color: Qt.darker(root.barForeground, 1.5)
+                font.family: root.barFontFamily
                 font.pixelSize: Style.font.caption
                 wrapMode: Text.Wrap
                 width: parent.width
@@ -2115,7 +2282,7 @@ Panel {
               textFormat: Text.PlainText
               text: strings.t("layout.confirmTitle")
               color: Commons.Color.popups.text
-              font.family: root.bar.fontFamily
+              font.family: root.barFontFamily
               font.pixelSize: Style.font.title
               font.bold: true
               width: parent.width
@@ -2126,7 +2293,7 @@ Panel {
               text: strings.t("layout.confirmBody")
                 .arg(Commons.I18n.formatNumber(root.confirmSecondsLeft))
               color: Qt.darker(Commons.Color.popups.text, 1.3)
-              font.family: root.bar.fontFamily
+              font.family: root.barFontFamily
               font.pixelSize: Style.font.body
               wrapMode: Text.Wrap
               width: parent.width
@@ -2141,7 +2308,7 @@ Panel {
                 width: (parent.width - parent.spacing) / 2
                 text: strings.t("layout.keep")
                 foreground: Commons.Color.popups.text
-                fontFamily: root.bar.fontFamily
+                fontFamily: root.barFontFamily
                 horizontalPadding: Style.spacing.sm
                 verticalPadding: Style.spacing.controlPaddingY
                 bordered: true
@@ -2154,7 +2321,7 @@ Panel {
                 width: (parent.width - parent.spacing) / 2
                 text: strings.t("layout.revertNow")
                 foreground: Commons.Color.popups.text
-                fontFamily: root.bar.fontFamily
+                fontFamily: root.barFontFamily
                 horizontalPadding: Style.spacing.sm
                 verticalPadding: Style.spacing.controlPaddingY
                 bordered: true
@@ -2175,8 +2342,8 @@ Panel {
 
     text: Commons.I18n.formatNumber(root.effectiveScale(scaleValue)) + "x"
     fontSize: Style.font.caption
-    foreground: root.bar.foreground
-    fontFamily: root.bar.fontFamily
+    foreground: root.barForeground
+    fontFamily: root.barFontFamily
     horizontalPadding: Style.spacing.sm
     verticalPadding: Style.spacing.controlPaddingY
     bordered: true
@@ -2204,9 +2371,9 @@ Panel {
     hasCursor: root.cursorActive && root.focusSection === "monitors" && root.selectedIndex === rowIndex
     onHasCursorChanged: if (hasCursor) root.ensureCursorVisible(monitorRow)
     current: isFocused
-    foreground: root.bar.foreground
-    fill: Style.hoverFillFor(root.bar.foreground, Commons.Color.accent)
-    currentFill: Style.selectedFillFor(root.bar.foreground, Commons.Color.accent)
+    foreground: root.barForeground
+    fill: Style.hoverFillFor(root.barForeground, Commons.Color.accent)
+    currentFill: Style.selectedFillFor(root.barForeground, Commons.Color.accent)
     implicitHeight: monitorInner.implicitHeight + Style.spacing.xl
     opacity: canToggle ? 1.0 : 0.45
 
@@ -2222,8 +2389,8 @@ Panel {
       Text {
         textFormat: Text.PlainText
         text: "󰍹"
-        color: root.bar.foreground
-        font.family: root.bar.fontFamily
+        color: root.barForeground
+        font.family: root.barFontFamily
         font.pixelSize: Style.font.title
         width: Style.space(22)
         horizontalAlignment: Text.AlignHCenter
@@ -2235,8 +2402,8 @@ Panel {
         text: monitorRow.display.focused
           ? Commons.I18n.t("monitor.displayFocused").arg(monitorRow.display.name)
           : monitorRow.display.name
-        color: root.bar.foreground
-        font.family: root.bar.fontFamily
+        color: root.barForeground
+        font.family: root.barFontFamily
         font.pixelSize: Style.font.body
         elide: Text.ElideRight
         width: parent.width - Style.space(22) - Style.space(14) - Style.space(16)
@@ -2246,8 +2413,8 @@ Panel {
       Text {
         textFormat: Text.PlainText
         text: monitorRow.display.enabled ? "󰄬" : ""
-        color: root.bar.foreground
-        font.family: root.bar.fontFamily
+        color: root.barForeground
+        font.family: root.barFontFamily
         font.pixelSize: Style.font.subtitle
         width: Style.space(14)
         horizontalAlignment: Text.AlignRight

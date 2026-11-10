@@ -68,4 +68,18 @@ grep -q 'output = "A".*position = "5120x0"' "$EVAL_LOG"
 run_case '[{"name":"A","mode":"2560x1440@59.95","position":"5120x0","scale":1,"transform":0,"disabled":false},{"name":"B","disabled":true}]'
 head -n 1 "$EVAL_LOG" | grep -q 'output = "B".*disabled = true'
 
+# Invalid rules are refused before any Lua is generated.
+reject_case() {
+  : > "$EVAL_LOG"
+  if python3 "$script_dir/../apply-order.py" "$1" >/dev/null 2>&1; then
+    echo "accepted invalid rules: $1" >&2
+    exit 1
+  fi
+  test ! -s "$EVAL_LOG"
+}
+
+reject_case '[{"name":"A\", disabled = true --","mode":"2560x1440@59.95","position":"0x0","scale":1,"transform":0,"disabled":false}]'
+reject_case '[{"name":"A B","mode":"2560x1440@59.95","position":"0x0","scale":1,"transform":0,"disabled":false}]'
+reject_case '[{"name":"A","mode":"2560x1440@59.95","position":"0x0","scale":0,"transform":0,"disabled":false}]'
+
 echo "apply-order tests passed"

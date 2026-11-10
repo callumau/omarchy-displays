@@ -31,5 +31,7 @@
   "layout.reverted": "Reverted to the previous layout",
   "layout.saveFailed": "Applied, but could not save the layout",
   "layout.revertFailed": "Could not revert the layout",
+  "layout.trialDropped": "Display set changed — apply to save this layout",
+  "layout.displaySetChanged": "Displays changed — arrangement reset",
   "layout.rememberHint": "Apply tests the layout live. Keep it within 15 seconds or it reverts. Keeping saves it for this exact set of displays."
 }
