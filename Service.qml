@@ -88,7 +88,7 @@ Item {
     console.log("io.github.callumau.displays: restoring preset for " + root.lastKey)
     root.applying = true
     // --live-only: automatic restores move displays now but never rewrite the
-    // user's monitors.conf. Only an explicit Apply saves configuration.
+    // user's monitors.conf. Only an explicit Keep saves configuration.
     applyProc.command = ["bash", root.pluginDir + "/apply-displays.sh", JSON.stringify(rules), "--live-only"]
     applyProc.running = true
     applyWatchdog.restart()

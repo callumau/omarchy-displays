@@ -316,6 +316,22 @@ function sortedByPosition(monitors) {
   })
 }
 
+// Stable display order for numbering and pills: enabled displays left-to-right,
+// top-to-bottom, followed by disabled displays sorted by name.
+function orderedMonitorNames(monitors) {
+  if (!Array.isArray(monitors)) return []
+  return monitors.slice().sort(function(a, b) {
+    var ae = a && a.enabled ? 0 : 1
+    var be = b && b.enabled ? 0 : 1
+    if (ae !== be) return ae - be
+    if (ae === 0) {
+      if (a.x !== b.x) return a.x - b.x
+      if (a.y !== b.y) return a.y - b.y
+    }
+    return a.name < b.name ? -1 : (a.name > b.name ? 1 : 0)
+  }).map(function(m) { return m.name })
+}
+
 function freePosition(monitors, name) {
   var right = 0
   var found = false
@@ -654,6 +670,7 @@ if (typeof module !== "undefined") {
     anyOverlap: anyOverlap,
     monitorOverlaps: monitorOverlaps,
     sortedByPosition: sortedByPosition,
+    orderedMonitorNames: orderedMonitorNames,
     freePosition: freePosition,
     layoutSize: layoutSize,
     rectsOverlap: rectsOverlap,

@@ -1,9 +1,10 @@
 # Displays for Omarchy
 
-A monitor layout panel for the [Omarchy](https://omarchy.org/) shell. It extends
-the built-in **Display** widget with a **Layout** tab for arranging screens,
-choosing resolution and refresh rate, setting a primary display, and restoring
-a saved layout whenever the same set of monitors is connected again.
+A monitor layout panel for the [Omarchy](https://omarchy.org/) shell. It
+replaces the built-in **Display** widget with a unified panel for arranging
+screens, identifying monitors, setting resolution, refresh rate, scale,
+brightness, and desktop text size, and automatically restoring saved layouts
+whenever the same set of monitors is connected again.
 
 Built with Quickshell/QML, Hyprland's Lua monitor API, and a small Python helper
 for safe swaps.
@@ -12,13 +13,13 @@ for safe swaps.
 
 - **Drag to arrange** displays on a visual canvas, with edge and origin snapping.
   Accent guide lines mark the snapped edge while dragging. A display dragged
-  into another one slides around it instead of overlapping — an overlap-free
-  spot is always what gets applied, and dropping somewhere nothing fits leaves
-  the display where it was.
-- **Auto** packs displays left to right; **Swap** reverses the order (the
-  quickest fix when left and right are inverted).
-- **Primary** moves the selected display to `0,0` and packs the rest to its
-  right. The star marks the display at the origin.
+  into another one slides around it instead of overlapping, and dropping it
+  where nothing fits leaves it where it was.
+- **Identify** briefly overlays each physical display with its number and output
+  name so you can match it to the layout canvas.
+- **Set as primary** (in the selected display's controls) moves that display to
+  `0,0` and packs the rest to its right. The star marks the display at the
+  origin.
 - **Resolution** and **refresh rate** per display, read from Hyprland's
   available modes.
 - **Apply** tests the layout live. A 15-second **Keep this layout?** prompt
@@ -52,30 +53,28 @@ Removing it restores the built-in widget.
 
 ## Usage
 
-Open it from the monitor icon in the bar, with `Super + Ctrl + D`, or directly
-on the Layout tab:
+Open it from the monitor icon in the bar, with `Super + Ctrl + D`, or via CLI:
 
 ```bash
-omarchy-shell io.github.callumau.displays.panel layout
+omarchy-shell io.github.callumau.displays.panel open
 ```
 
-### Display tab
-
-The original brightness, text size, scale, and enable/disable controls remain.
-
-### Layout tab
-
-- Drag the display rectangles to arrange them.
-- **Auto** packs enabled displays left to right in their current order.
-- **Swap** reverses that order.
-- **Primary** puts the selected display at `0,0`.
-- Pick a **resolution** and **refresh rate** for the selected display.
-- **Apply** tries the layout live. Confirm with **Keep** within 15 seconds, or
-  it automatically restores the previous layout. Only **Keep** writes
+- Drag the display rectangles to arrange them, or click a display (or its pill)
+  to select it.
+- **Identify** shows matching numbers on every active display for 3 seconds.
+- For the selected display, adjust **brightness** (live, when supported by the
+  display), toggle **On/Off**, set it as **primary** (`0,0`), slide **scale**
+  (`0.5x`–`4x`), and pick **resolution**, **refresh rate**, and
+  **orientation** (horizontal/vertical).
+- **Apply** previews layout, scale, resolution, refresh, orientation, and
+  enable/disable changes live. Confirm with **Keep** within 15 seconds, or it
+  automatically restores the previous layout. Only **Keep** writes
   `monitors.conf` and saves the preset. The pending confirmation is recorded
   on disk, so even a shell restart mid-trial brings the prompt back (or
   reverts immediately if the countdown already expired) instead of stranding
   the trial layout.
+- **Text size** adjusts desktop-wide text sizing (shell, GTK apps, and
+  terminals) live.
 
 > Hyprland has no separate "primary output" flag. Primary here means the
 > display placed at the origin, `0,0`, which is how most apps and games pick
@@ -176,4 +175,5 @@ fully stock setup again.
 
 ## License
 
-MIT. See [LICENSE](LICENSE).
+MIT. See [LICENSE](LICENSE) (includes Omarchy's original MIT notice for portions
+reused from the built-in `omarchy.monitor` widget).

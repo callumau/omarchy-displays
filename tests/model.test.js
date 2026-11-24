@@ -226,4 +226,14 @@ const unseen = {
 const portraitRules = Model.presetRules(portraitPreset, [rotated[0], unseen])
 assert.equal(portraitRules.find(rule => rule.name === "HDMI-A-1").position, "1440x0")
 
+// Monitor numbering orders enabled displays left-to-right, top-to-bottom,
+// with disabled displays last sorted by name.
+assert.deepEqual(Model.orderedMonitorNames(monitors), ["DP-11", "DP-7", "eDP-1"])
+assert.deepEqual(Model.orderedMonitorNames([
+  { name: "HDMI-A-1", enabled: false, x: 0, y: 0 },
+  { name: "DP-2", enabled: true, x: 0, y: 1440 },
+  { name: "DP-1", enabled: true, x: 0, y: 0 },
+  { name: "DP-3", enabled: false, x: 0, y: 0 }
+]), ["DP-1", "DP-2", "DP-3", "HDMI-A-1"])
+
 console.log("model tests passed")
