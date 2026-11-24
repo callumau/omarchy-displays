@@ -778,7 +778,9 @@ Panel {
     applyRunning = true
 
     // Trial only: no monitors.conf or preset write until the user keeps it.
-    applyProc.command = ["bash", pluginDir + "/apply-displays.sh", JSON.stringify(rules), "--live-only"]
+    var steps = Model.planApplySteps(previousLayoutRules, rules)
+    applyProc.command = ["bash", pluginDir + "/apply-displays.sh",
+      JSON.stringify(steps.length > 0 ? steps : rules), "--live-only"]
     applyProc.running = true
   }
 
@@ -872,7 +874,9 @@ Panel {
 
     // config and preset still describe the previous layout, so a live apply
     // is enough to bring it back.
-    applyProc.command = ["bash", pluginDir + "/apply-displays.sh", JSON.stringify(previousLayoutRules), "--live-only"]
+    var steps = Model.planApplySteps(pendingLayoutRules, previousLayoutRules)
+    applyProc.command = ["bash", pluginDir + "/apply-displays.sh",
+      JSON.stringify(steps.length > 0 ? steps : previousLayoutRules), "--live-only"]
     applyProc.running = true
   }
 

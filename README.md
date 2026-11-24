@@ -6,8 +6,8 @@ screens, identifying monitors, setting resolution, refresh rate, scale,
 brightness, and desktop text size, and automatically restoring saved layouts
 whenever the same set of monitors is connected again.
 
-Built with Quickshell/QML, Hyprland's Lua monitor API, and a small Python helper
-for safe swaps.
+Built with Quickshell/QML, Hyprland's Lua monitor API, and a small Bash helper
+for config writes and validation.
 
 ## Features
 
@@ -109,9 +109,8 @@ to forget that layout.
 |------|---------|
 | `Panel.qml` | Bar widget and Display/Layout panel |
 | `Service.qml` | Watches monitor changes and restores presets |
-| `Model.js` | Pure parsing, overlap, and preset-matching helpers |
+| `Model.js` | Pure parsing, overlap, swap-ordering, and preset-matching helpers |
 | `apply-displays.sh` | Validates a layout, writes config, applies it live |
-| `apply-order.py` | Orders swaps to avoid transient overlaps |
 | `i18n/en.json` | Plugin-owned strings |
 | `~/.config/hypr/monitors.conf` | Generated rules read by `monitors.lua` |
 | `~/.config/hypr/monitors.conf.bak` | Previous generated file |
@@ -124,8 +123,6 @@ The plugin never writes under `/usr/share/omarchy/`.
 - Omarchy with the Quickshell shell (`omarchy-shell`)
 - Hyprland with the Lua config provider
 - `jq` and `hyprctl`
-- Python 3 is optional: without it, layouts still apply, but swaps use a simple
-  sequential order and may briefly overlap.
 
 ## Development
 
@@ -139,15 +136,13 @@ Run the local checks:
 
 ```bash
 bash -n apply-displays.sh
-python3 -m py_compile apply-order.py
 node tests/model.test.js
 node tests/drag.test.js
-bash tests/apply-order.test.sh
 bash tests/apply-displays.test.sh
 ```
 
-The shell and Python tests use a fake `hyprctl`, so they do not touch the
-running compositor.
+The shell test uses a fake `hyprctl`, so it does not touch the running
+compositor.
 
 Before tagging a release, prove the widget still loads in a real shell:
 

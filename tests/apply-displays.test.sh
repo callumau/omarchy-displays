@@ -9,36 +9,15 @@ trap 'rm -rf "$tmp"' EXIT
 mkdir -p "$tmp/bin" "$tmp/home/.config/hypr"
 printf 'monitor=KEEP_ME\n' > "$tmp/home/.config/hypr/monitors.conf"
 
-cat > "$tmp/bin/hyprctl" <<'PY'
-#!/usr/bin/env python3
-import json
-import os
-import sys
-
-args = sys.argv[1:]
-if args[:3] == ["-j", "monitors", "all"]:
-    print(json.dumps([
-        {
-            "name": "A", "description": "Monitor A", "width": 2560,
-            "height": 1440, "refreshRate": 59.951, "x": 0, "y": 0,
-            "scale": 1, "transform": 0, "disabled": False, "focused": True
-        },
-        {
-            "name": "B", "description": "Monitor B", "width": 2560,
-            "height": 1440, "refreshRate": 59.951, "x": 2560, "y": 0,
-            "scale": 1, "transform": 0, "disabled": False, "focused": False
-        }
-    ]))
-    sys.exit(0)
-
-if args[:1] == ["eval"]:
-    with open(os.environ["EVAL_LOG"], "a") as log:
-        log.write(args[1] + "\n")
-    print("ok")
-    sys.exit(0)
-
-sys.exit(1)
-PY
+cat > "$tmp/bin/hyprctl" <<'SH'
+#!/bin/bash
+if [[ ${1:-} == "eval" ]]; then
+  printf '%s\n' "${2:-}" >> "$EVAL_LOG"
+  echo "ok"
+  exit 0
+fi
+exit 1
+SH
 chmod +x "$tmp/bin/hyprctl"
 
 export PATH="$tmp/bin:$PATH"
@@ -108,7 +87,7 @@ reject '[{"name":"DP-1\", disabled = true --","identity":"Hostile","description"
 reject '[{"name":"DP 1","identity":"Hostile","description":"Hostile","mode":"2560x1440@59.95","position":"0x0","scale":1,"transform":0,"disabled":false}]' name
 reject '[{"name":"DP-1","identity":"Hostile","description":"Dell \"wide\" panel","mode":"2560x1440@59.95","position":"0x0","scale":1,"transform":0,"disabled":false}]' description
 
-# apply-order.py cannot apply these, so they must fail before the config write.
+# Non-explicit mode/position values are refused before config write.
 reject '[{"name":"DP-1","identity":"Hostile","description":"Hostile","mode":"preferred","position":"0x0","scale":1,"transform":0,"disabled":false}]' mode
 reject '[{"name":"DP-1","identity":"Hostile","description":"Hostile","mode":"2560x1440@59.95","position":"auto","scale":1,"transform":0,"disabled":false}]' position
 

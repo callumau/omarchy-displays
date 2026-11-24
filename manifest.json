@@ -2,7 +2,7 @@
   "schemaVersion": 1,
   "id": "io.github.callumau.displays",
   "name": "Displays",
-  "version": "1.4.0",
+  "version": "1.4.1",
   "author": "Callum (callumau)",
   "license": "MIT",
   "description": "Arrange displays, set resolution, refresh rate, and primary display, and automatically restore saved layouts",

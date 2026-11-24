@@ -71,8 +71,6 @@ case "$action" in
   *) fail "unknown option: $action" ;;
 esac
 
-script_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
-
 # The panel and the preset watcher can both apply at once (for example a
 # hotplug while Apply is pressed). Serialize them so the last layout is whole.
 if command -v flock >/dev/null 2>&1; then
@@ -236,26 +234,18 @@ fi
 
 if [[ $action != "--commit" ]]; then
   failures=0
-  if command -v python3 >/dev/null 2>&1 && [[ -f $script_dir/apply-order.py ]]; then
-    # Moves a display out of the way first when a swap would briefly overlap,
-    # so Hyprland does not warn about an incorrect layout in between.
-    if ! python3 "$script_dir/apply-order.py" "$payload" >/dev/null; then
-      failures=1
+  while IFS= read -r expression; do
+    [[ -n $expression ]] || continue
+    output=$(hyprctl eval "$expression" 2>&1) || {
+      echo "hyprctl eval failed: $output" >&2
+      failures=$((failures + 1))
+      continue
+    }
+    if [[ -n $output && $output != "ok" ]]; then
+      echo "hyprctl eval: $output" >&2
+      failures=$((failures + 1))
     fi
-  else
-    while IFS= read -r expression; do
-      [[ -n $expression ]] || continue
-      output=$(hyprctl eval "$expression" 2>&1) || {
-        echo "hyprctl eval failed: $output" >&2
-        failures=$((failures + 1))
-        continue
-      }
-      if [[ -n $output && $output != "ok" ]]; then
-        echo "hyprctl eval: $output" >&2
-        failures=$((failures + 1))
-      fi
-    done < <(jq -r "$LUA_JQ" <<<"$payload")
-  fi
+  done < <(jq -r "$LUA_JQ" <<<"$payload")
 
   if (( failures > 0 )); then
     if [[ $action == "--live-only" ]]; then

@@ -236,4 +236,61 @@ assert.deepEqual(Model.orderedMonitorNames([
   { name: "DP-3", enabled: false, x: 0, y: 0 }
 ]), ["DP-1", "DP-2", "DP-3", "HDMI-A-1"])
 
+// Overlap-free apply planning (replaces apply-order.py):
+{
+  const currentAB = [
+    { name: "A", width: 2560, height: 1440, refreshRate: 59.951, x: 0, y: 0, scale: 1, transform: 0, enabled: true },
+    { name: "B", width: 2560, height: 1440, refreshRate: 59.951, x: 2560, y: 0, scale: 1, transform: 0, enabled: true }
+  ]
+
+  // A swap parks A to the right, moves B to 0x0, then places A at 2560x0.
+  const swapSteps = Model.planApplySteps(currentAB, [
+    { name: "A", mode: "2560x1440@59.95", position: "2560x0", scale: 1, transform: 0, disabled: false },
+    { name: "B", mode: "2560x1440@59.95", position: "0x0", scale: 1, transform: 0, disabled: false }
+  ])
+  assert.equal(swapSteps.length, 3)
+  assert.equal(swapSteps[0].name, "A")
+  assert.equal(swapSteps[0].position, "5320x0")
+  assert.equal(swapSteps[1].name, "B")
+  assert.equal(swapSteps[1].position, "0x0")
+  assert.equal(swapSteps[2].name, "A")
+  assert.equal(swapSteps[2].position, "2560x0")
+
+  // Works identically when currentMonitors are rule objects (e.g., trial revert).
+  const ruleSwap = Model.planApplySteps([
+    { name: "A", mode: "2560x1440@59.95", position: "0x0", scale: 1, transform: 0, disabled: false },
+    { name: "B", mode: "2560x1440@59.95", position: "2560x0", scale: 1, transform: 0, disabled: false }
+  ], [
+    { name: "A", mode: "2560x1440@59.95", position: "2560x0", scale: 1, transform: 0, disabled: false },
+    { name: "B", mode: "2560x1440@59.95", position: "0x0", scale: 1, transform: 0, disabled: false }
+  ])
+  assert.deepEqual(ruleSwap.map(s => s.name + "@" + s.position), ["A@5320x0", "B@0x0", "A@2560x0"])
+
+  // An already-correct layout emits zero steps.
+  const noopSteps = Model.planApplySteps(currentAB, [
+    { name: "A", mode: "2560x1440@59.95", position: "0x0", scale: 1, transform: 0, disabled: false },
+    { name: "B", mode: "2560x1440@59.95", position: "2560x0", scale: 1, transform: 0, disabled: false }
+  ])
+  assert.equal(noopSteps.length, 0)
+
+  // A simple non-overlapping move emits a single step without parking.
+  const simpleSteps = Model.planApplySteps(currentAB, [
+    { name: "A", mode: "2560x1440@59.95", position: "5120x0", scale: 1, transform: 0, disabled: false },
+    { name: "B", mode: "2560x1440@59.95", position: "2560x0", scale: 1, transform: 0, disabled: false }
+  ])
+  assert.equal(simpleSteps.length, 1)
+  assert.equal(simpleSteps[0].name, "A")
+  assert.equal(simpleSteps[0].position, "5120x0")
+
+  // Disabling a display happens before remaining moves.
+  const disableSteps = Model.planApplySteps(currentAB, [
+    { name: "A", mode: "2560x1440@59.95", position: "2560x0", scale: 1, transform: 0, disabled: false },
+    { name: "B", disabled: true }
+  ])
+  assert.equal(disableSteps[0].name, "B")
+  assert.equal(disableSteps[0].disabled, true)
+  assert.equal(disableSteps[1].name, "A")
+  assert.equal(disableSteps[1].position, "2560x0")
+}
+
 console.log("model tests passed")

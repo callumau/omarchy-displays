@@ -650,6 +650,163 @@ function presetRules(preset, monitors) {
   return rules
 }
 
+// Plan an overlap-free sequence of rule steps for Hyprland's sequential
+// hl.monitor() calls. Accepts either parsed monitor objects or rule objects as
+// currentMonitors. Skips unchanged monitors, disables first, and parks a
+// monitor off to the right when a swap cycle would otherwise briefly overlap.
+function planApplySteps(currentMonitors, targetRules) {
+  if (!Array.isArray(targetRules) || targetRules.length === 0) return []
+
+  var current = {}
+  if (Array.isArray(currentMonitors)) {
+    for (var i = 0; i < currentMonitors.length; i++) {
+      var m = currentMonitors[i]
+      if (!m || !m.name) continue
+      var disabled = m.disabled === true || m.enabled === false
+      if (disabled) {
+        current[m.name] = { disabled: true }
+        continue
+      }
+      var mode = m.mode ? parseModeString(m.mode) : null
+      var pos = m.position ? parsePosition(m.position) : null
+      var w = mode ? mode.width : Number(m.width || 0)
+      var h = mode ? mode.height : Number(m.height || 0)
+      var refresh = mode ? Number(mode.refresh) : Number(m.refreshRate || 0)
+      var scale = Number(m.scale)
+      if (!isFinite(scale) || scale <= 0) scale = 1
+      var transform = clampInteger(m.transform, 0, 7, 0)
+      var rotated = transform % 2 === 1
+      var fw = Math.max(1, Math.round((rotated ? h : w) / scale))
+      var fh = Math.max(1, Math.round((rotated ? w : h) / scale))
+      current[m.name] = {
+        disabled: false,
+        x: pos ? pos.x : clampInteger(m.x, -100000, 100000, 0),
+        y: pos ? pos.y : clampInteger(m.y, -100000, 100000, 0),
+        w: fw,
+        h: fh,
+        modeWidth: w,
+        modeHeight: h,
+        refresh: refresh,
+        scale: scale,
+        transform: transform
+      }
+    }
+  }
+
+  var steps = []
+  var disabledNames = {}
+  var enabled = []
+
+  for (var j = 0; j < targetRules.length; j++) {
+    var rule = targetRules[j]
+    if (!rule || !rule.name) continue
+    if (rule.disabled === true) {
+      disabledNames[rule.name] = true
+      var cur = current[rule.name]
+      if (!cur || !cur.disabled) steps.push(rule)
+      continue
+    }
+    var parsedMode = parseModeString(rule.mode)
+    var parsedPos = parsePosition(rule.position)
+    if (!parsedMode || !parsedPos) {
+      steps.push(rule)
+      continue
+    }
+    var rScale = Number(rule.scale)
+    if (!isFinite(rScale) || rScale <= 0) rScale = 1
+    var rTransform = clampInteger(rule.transform, 0, 7, 0)
+    var rRotated = rTransform % 2 === 1
+    enabled.push({
+      rule: rule,
+      name: rule.name,
+      x: parsedPos.x,
+      y: parsedPos.y,
+      w: Math.max(1, Math.round((rRotated ? parsedMode.height : parsedMode.width) / rScale)),
+      h: Math.max(1, Math.round((rRotated ? parsedMode.width : parsedMode.height) / rScale)),
+      modeWidth: parsedMode.width,
+      modeHeight: parsedMode.height,
+      refresh: Number(parsedMode.refresh),
+      scale: rScale,
+      transform: rTransform
+    })
+  }
+
+  var positions = {}
+  var pending = []
+  for (var k = 0; k < enabled.length; k++) {
+    var t = enabled[k]
+    var c = current[t.name]
+    var atTarget = c && !c.disabled
+      && c.x === t.x && c.y === t.y
+      && Math.abs(c.scale - t.scale) <= 0.0001
+      && c.transform === t.transform
+      && c.modeWidth === t.modeWidth
+      && c.modeHeight === t.modeHeight
+      && Math.abs(c.refresh - t.refresh) <= 0.005
+    if (c && !c.disabled) positions[t.name] = { x: c.x, y: c.y, w: c.w, h: c.h }
+    else positions[t.name] = null
+
+    if (atTarget) positions[t.name] = { x: t.x, y: t.y, w: t.w, h: t.h }
+    else pending.push(t)
+  }
+
+  function safeNow(target) {
+    for (var name in positions) {
+      if (name === target.name || disabledNames[name]) continue
+      var other = positions[name]
+      if (!other) continue
+      if (rectsOverlap(target.x, target.y, target.w, target.h, other.x, other.y, other.w, other.h))
+        return false
+    }
+    return true
+  }
+
+  var parked = {}
+  var guard = 0
+  var limit = 10 * enabled.length + 10
+  while (pending.length > 0 && guard < limit) {
+    guard++
+    var chosenIdx = -1
+    for (var p = 0; p < pending.length; p++) {
+      if (safeNow(pending[p])) { chosenIdx = p; break }
+    }
+    if (chosenIdx >= 0) {
+      var chosen = pending.splice(chosenIdx, 1)[0]
+      steps.push(chosen.rule)
+      positions[chosen.name] = { x: chosen.x, y: chosen.y, w: chosen.w, h: chosen.h }
+      continue
+    }
+
+    var parkCandidate = null
+    for (var q = 0; q < pending.length; q++) {
+      if (!parked[pending[q].name]) { parkCandidate = pending[q]; break }
+    }
+    if (!parkCandidate) {
+      var forced = pending.shift()
+      steps.push(forced.rule)
+      positions[forced.name] = { x: forced.x, y: forced.y, w: forced.w, h: forced.h }
+      continue
+    }
+
+    var maxRight = 0
+    for (var pname in positions) {
+      if (positions[pname]) maxRight = Math.max(maxRight, positions[pname].x + positions[pname].w)
+    }
+    for (var e = 0; e < enabled.length; e++) {
+      maxRight = Math.max(maxRight, enabled[e].x + enabled[e].w)
+    }
+    var parkX = maxRight + 200
+    var parkRule = {}
+    for (var key in parkCandidate.rule) parkRule[key] = parkCandidate.rule[key]
+    parkRule.position = parkX + "x0"
+    steps.push(parkRule)
+    positions[parkCandidate.name] = { x: parkX, y: 0, w: parkCandidate.w, h: parkCandidate.h }
+    parked[parkCandidate.name] = true
+  }
+
+  return steps
+}
+
 if (typeof module !== "undefined") {
   module.exports = {
     clampBrightness: clampBrightness,
@@ -683,6 +840,7 @@ if (typeof module !== "undefined") {
     parsePosition: parsePosition,
     bestPreset: bestPreset,
     layoutMatchesPreset: layoutMatchesPreset,
-    presetRules: presetRules
+    presetRules: presetRules,
+    planApplySteps: planApplySteps
   }
 }
