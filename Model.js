@@ -460,11 +460,45 @@ function resolveDrag(monitors, name, rawX, rawY) {
 
   if (firstOverlap()) return null
 
+  var edgeXs = [0]
+  var edgeYs = [0]
+  for (var m = 0; m < monitors.length; m++) {
+    var sib = monitors[m]
+    if (!sib || sib.name === name || !sib.enabled) continue
+    var sibSize = layoutSize(sib)
+    edgeXs.push(sib.x, sib.x + sibSize.w)
+    edgeYs.push(sib.y, sib.y + sibSize.h)
+  }
+
+  var rx = Math.round(x)
+  var ry = Math.round(y)
+  var snappedX = false
+  var guideX = rx
+  if (edgeXs.indexOf(rx) >= 0) {
+    snappedX = true
+    guideX = rx
+  } else if (edgeXs.indexOf(rx + w) >= 0) {
+    snappedX = true
+    guideX = rx + w
+  }
+
+  var snappedY = false
+  var guideY = ry
+  if (edgeYs.indexOf(ry) >= 0) {
+    snappedY = true
+    guideY = ry
+  } else if (edgeYs.indexOf(ry + h) >= 0) {
+    snappedY = true
+    guideY = ry + h
+  }
+
   return {
-    x: Math.round(x),
-    y: Math.round(y),
-    snappedX: candidates.xs.indexOf(x) >= 0,
-    snappedY: candidates.ys.indexOf(y) >= 0
+    x: rx,
+    y: ry,
+    snappedX: snappedX,
+    snappedY: snappedY,
+    guideX: guideX,
+    guideY: guideY
   }
 }
 

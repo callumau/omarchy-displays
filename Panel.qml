@@ -72,6 +72,14 @@ Panel {
   property var liveLayoutRules: []
   property string trialIntent: ""
   property bool trialResumed: false
+  property string trialScreenName: ""
+
+  // Hyprland leaves an already-mapped layer surface at its old global position
+  // when its monitor moves within the layout (see qs.Ui's ScreenMoveRemap).
+  // Close and reopen once the monitor's origin settles so the panel stays on
+  // the same physical display instead of landing on whichever monitor moved
+  // into the old coordinates.
+  property bool pendingRemapReopen: false
 
   // Drag state shared by the monitor cards.
   property string dragMonitorName: ""
@@ -511,6 +519,14 @@ Panel {
       probeBrightness(selectedLayoutName)
   }
 
+  function hasScreen(name) {
+    if (!name) return false
+    for (var i = 0; i < Quickshell.screens.length; i++) {
+      if (Quickshell.screens[i] && Quickshell.screens[i].name === name) return true
+    }
+    return false
+  }
+
   function resumeTrial(raw) {
     if (trialResumed) return
     trialResumed = true
@@ -528,6 +544,17 @@ Panel {
       return
     }
 
+    // Only the screen where Apply was clicked should own the confirmation
+    // prompt. When a monitor move recreates a sibling bar, that sibling's
+    // newly loaded Panel must not steal the popup onto the wrong display.
+    // Fall back to any remaining screen only if the original screen is gone
+    // (e.g., the user disabled it in the trial).
+    var targetScreen = String(trial.screen || "")
+    var myScreen = panel.screen ? String(panel.screen.name || "") : ""
+    if (targetScreen !== "" && myScreen !== "" && targetScreen !== myScreen && hasScreen(targetScreen))
+      return
+
+    trialScreenName = targetScreen !== "" ? targetScreen : myScreen
     pendingLayoutRules = trial.pending
     previousLayoutRules = trial.previous
 
@@ -618,9 +645,9 @@ Panel {
     next.y = resolved.y
     replaceMonitor(next)
     snapX = resolved.snappedX
-    snapGuideX = resolved.x
+    snapGuideX = resolved.guideX
     snapY = resolved.snappedY
-    snapGuideY = resolved.y
+    snapGuideY = resolved.guideY
     layoutDirty = true
   }
 
@@ -770,6 +797,7 @@ Panel {
       return
     }
 
+    trialScreenName = panel.screen ? String(panel.screen.name || "") : ""
     pendingLayoutRules = rules
     previousLayoutRules = liveLayoutRules.slice()
     applyMode = "apply"
@@ -791,7 +819,8 @@ Panel {
       pending: pendingLayoutRules,
       previous: previousLayoutRules,
       deadline: confirmDeadline,
-      monitors: names
+      monitors: names,
+      screen: trialScreenName !== "" ? trialScreenName : (panel.screen ? String(panel.screen.name || "") : "")
     }
   }
 
@@ -928,6 +957,8 @@ Panel {
 
   onOpenedChanged: {
     if (opened) {
+      pendingRemapReopen = false
+      screenMoveReopen.stop()
       refresh()
     } else {
       // A drag whose delegate died mid-press (close while held) never delivers
@@ -938,7 +969,35 @@ Panel {
       stopIdentify()
     }
   }
-  onConfirmPendingChanged: if (confirmPending && opened) confirmOverlay.forceActiveFocus()
+
+  Timer {
+    id: screenMoveSettle
+    interval: 260
+    repeat: false
+    onTriggered: {
+      if (!root.opened) return
+      root.pendingRemapReopen = true
+      root.close()
+      if (!panel.visible) screenMoveReopen.restart()
+    }
+  }
+
+  Timer {
+    id: screenMoveReopen
+    interval: 50
+    repeat: false
+    onTriggered: {
+      if (!root.pendingRemapReopen) return
+      root.pendingRemapReopen = false
+      root.open()
+    }
+  }
+
+  Connections {
+    target: panel.screen
+    function onXChanged() { if (root.opened) screenMoveSettle.restart() }
+    function onYChanged() { if (root.opened) screenMoveSettle.restart() }
+  }
 
   // Poll while the panel is open so hotplugs update the canvas.
   Timer {
@@ -1185,6 +1244,7 @@ Panel {
     focusTarget: panel.loadedContent
     contentWidth: panel.fittedContentWidth(Style.space(440))
     contentHeight: panel.fittedContentHeight(panel.loadedContentHeight, Style.space(760))
+    onVisibleChanged: if (!visible && root.pendingRemapReopen) screenMoveReopen.restart()
 
     content: PanelKeyCatcher {
       id: keyCatcher
@@ -1947,6 +2007,11 @@ Panel {
         z: 100
         focus: true
         onVisibleChanged: if (visible) forceActiveFocus()
+        Connections {
+          target: root
+          function onOpenedChanged() { if (root.opened && root.confirmPending) confirmOverlay.forceActiveFocus() }
+          function onConfirmPendingChanged() { if (root.opened && root.confirmPending) confirmOverlay.forceActiveFocus() }
+        }
         Keys.onReturnPressed: root.keepPendingLayout()
         Keys.onEnterPressed: root.keepPendingLayout()
         Keys.onSpacePressed: root.keepPendingLayout()

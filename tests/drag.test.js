@@ -101,13 +101,24 @@ console.log("drag sweep invariant passed")
   assert.equal(snapped.snappedX, true)
 
   // Right-edge to right-edge alignment from below: C.left snaps to
-  // A.right - C.width while its top snaps to A.bottom.
+  // A.right - C.width while its top snaps to A.bottom. The X guide sits on
+  // the shared right edge (A.right = 2560), not C's outer left edge (1280).
   const narrow = [monitor("A", 0, 0, 2560, 1440), monitor("C", 6000, 3000, 1280, 1440)]
   const aligned = Model.resolveDrag(narrow, "C", 1290, 1446)
   assert.equal(aligned.x, 1280)
   assert.equal(aligned.y, 1440)
   assert.equal(aligned.snappedX, true)
+  assert.equal(aligned.guideX, 2560)
   assert.equal(aligned.snappedY, true)
+  assert.equal(aligned.guideY, 1440)
+
+  // Dragging to the left of A snaps C's right edge to A's left edge (x=0),
+  // so guideX sits on the seam (0), not C's outer left edge (-2560).
+  const leftOfA = Model.resolveDrag(pair, "C", -2550, 8)
+  assert.equal(leftOfA.x, -2560)
+  assert.equal(leftOfA.snappedX, true)
+  assert.equal(leftOfA.guideX, 0)
+  assert.equal(leftOfA.guideY, 0)
 }
 console.log("drag snapping passed")
 
